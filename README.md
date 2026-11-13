@@ -1,4 +1,4 @@
-# Kompromat
+# Компромат
 
 Kompromat is a minimalist, open-source protocol for capture-the-flag workflows
 on your infrastructure. Mechanically, a simple CLI is used to produce a key file. Whoever finds it can prove
