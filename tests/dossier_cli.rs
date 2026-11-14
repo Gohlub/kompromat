@@ -83,37 +83,44 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     fs::write(path.join("manifest.json"), manifest.to_string()).unwrap();
     success(cli(path, &["register", "manifest.json", "--api", &api.url]));
 
-    let mut threads = Vec::new();
-    for (file, note) in [
-        ("alice.json", "Alice found an export bug"),
-        ("bob.json", "Bob found a cache bug"),
+    let mut receipts = Vec::new();
+    for (out_flag, file, note) in [
+        (
+            "--dossier-key-out",
+            "alice.json",
+            "Alice found an export bug",
+        ),
+        ("--finder-out", "bob.json", "Bob found a cache bug"),
     ] {
         let report = success(cli(
             path,
-            &[
-                "report",
-                "flag.json",
-                "--message",
-                note,
-                "--finder-out",
-                file,
-            ],
+            &["report", "flag.json", "--message", note, out_flag, file],
         ));
-        threads.push(report["thread"].as_str().unwrap().to_owned());
-        let retry = success(cli(path, &["report", file]));
-        assert_eq!(report["thread"], retry["thread"]);
+        let receipt = &report["receipt"];
+        assert_eq!(report["dossier_key_file"], file);
+        assert_eq!(
+            receipt["sequence"].as_u64(),
+            Some(receipts.len() as u64 + 1)
+        );
+        assert!(receipt["accepted_at"].as_str().unwrap().ends_with('Z'));
+        let key: Value = serde_json::from_slice(&fs::read(path.join(file)).unwrap()).unwrap();
+        assert!(!report.to_string().contains(key["secret"].as_str().unwrap()));
+        assert!(!report.to_string().contains(note));
+        receipts.push(receipt.clone());
     }
-    let alice = &threads[0];
-    let bob = &threads[1];
+    let alice = receipts[0]["dossier_id"].as_str().unwrap();
+    let bob = receipts[1]["dossier_id"].as_str().unwrap();
     assert_ne!(alice, bob);
+    let retry = success(cli(path, &["report", "alice.json"]));
+    assert_eq!(retry["receipt"], receipts[0]);
     let inbox = success(cli(path, &["unlock", "defender.json"]));
-    assert_eq!(inbox["threads"], serde_json::json!(threads));
+    assert_eq!(inbox["receipts"], serde_json::json!(receipts));
     success(cli(
         path,
         &[
             "attach",
             "defender.json",
-            "--thread",
+            "--dossier",
             alice,
             "--message",
             "Which request?",
@@ -139,7 +146,7 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
         serde_json::json!(["Bob found a cache bug"])
     );
     assert!(
-        !cli(path, &["unlock", "bob.json", "--thread", alice])
+        !cli(path, &["unlock", "bob.json", "--dossier", alice])
             .status
             .success()
     );
@@ -149,13 +156,15 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
             .success()
     );
 
-    let opening = reqwest::blocking::get(format!("{}/threads/{alice}", api.url))
+    let opening = reqwest::blocking::get(format!("{}/threads/{alice}?receipt=true", api.url))
         .unwrap()
         .error_for_status()
         .unwrap()
         .text()
         .unwrap();
     assert!(!opening.contains("Alice found an export bug"));
+    let public_report: Value = serde_json::from_str(&opening).unwrap();
+    assert_eq!(public_report["receipt"], receipts[0]);
     let shared: Vec<Value> = reqwest::blocking::get(format!(
         "{}/dossiers/{}/messages",
         api.url,
@@ -167,6 +176,12 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     .json()
     .unwrap();
     assert!(shared.is_empty());
+
+    let capture = success(cli(path, &["report", "flag.json"]));
+    let id = capture["receipt"]["dossier_id"].as_str().unwrap();
+    let default_file = format!("dossier-key-{id}.json");
+    assert_eq!(capture["dossier_key_file"], default_file);
+    assert!(path.join(default_file).is_file());
 }
 
 #[test]

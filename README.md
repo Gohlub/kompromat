@@ -23,7 +23,7 @@ separate encryption key from the same secret with `HKDF-SHA256`, encrypts the te
 with `XChaCha20-Poly1305`, and signs the proof together with the encrypted reply.
 Anyone who holds a copy of the key file can read the reply.
 
-## Private finder dossiers
+## Private dossiers
 
 To give each finder a private conversation with the defender, generate a flag
 with a separate defender file:
@@ -37,26 +37,31 @@ Plant only `flag.json`. Keep `defender.json` on the defender’s machine. The
 planted flag pins the defender’s public key, which is also in the manifest.
 Set `--api` on both commands when using a remote facilitator.
 
-The finder opens a dossier with the first report:
+After capturing the flag, the finder opens a dossier with an encrypted write-up.
 
 ```sh
-kompromat report flag.json --message 'I could read the other tenant’s export' --finder-out alice.json
+kompromat report flag.json --message 'I could read the other tenant’s export' --dossier-key-out alice.json
 ```
 
-Keep the local receipt `alice.json`; it contains the finder’s private key.
-If the connection fails after creating the receipt, `kompromat report alice.json`
-resubmits the same opening. The defender can list dossier IDs, select one, and
-reply. The finder can read or reply using just their receipt:
+Keep the **dossier key** (`alice.json`) on the finder’s machine. Without an
+explicit output path, the CLI saves it as `dossier-key-<id>.json`. If the
+connection fails, `kompromat report alice.json` resubmits the same opening.
+
+The facilitator returns a **capture receipt** with the public dossier ID,
+acceptance sequence for this flag, and UTC acceptance time. The defender sees
+the same receipts in acceptance order. Retrying preserves the original receipt.
+Reports accepted before timestamps were recorded have a null acceptance time.
+The receipt records capture. The defender judges the write-up and awards any bounty.
 
 ```sh
 kompromat unlock defender.json
-kompromat unlock defender.json --thread THREAD_ID
-kompromat attach defender.json --thread THREAD_ID --message 'Which export request did you send?'
+kompromat unlock defender.json --dossier DOSSIER_ID
+kompromat attach defender.json --dossier DOSSIER_ID --message 'Which export request did you send?'
 kompromat unlock alice.json
 kompromat attach alice.json --message 'I used the scheduled export.'
 ```
 
-The thread ID is a fresh public key generated for that report. The finder and
+The dossier ID is a fresh public key generated for that report. The finder and
 defender derive the encryption key locally. Their first note and subsequent
 messages are encrypted and signed. The planted flag signs the opening proof.
 The facilitator can see the flag, thread, senders, and ciphertext. Another
@@ -66,10 +71,17 @@ without `--defender-out` retain the shared dossier described above.
 ## What the API does
 
 The API is a small HTTP service backed by SQLite. The `register` command sends
-the manifest to the API. A *finder* sends a signed proof to `POST /proofs`.
+the manifest to the API. In the original shared-dossier flow, a finder sends a
+signed proof and optional encrypted note to `POST /proofs`.
 The API verifies it against the registered key and stores it for retrieval. The server does this without knowing where you placed the file or what it means to you.
 
-In the dossier, a finder can leave an encrypted note with `report --message`.
+Private dossiers use `POST /threads` to accept the flag proof and the
+finder’s signed first message in one transaction. Request `?receipt=true`
+on that endpoint to receive the opening and its durable receipt. The same
+option on `GET /dossiers/{flag}/threads` returns the ordered inbox. These
+records are persisted whether or not the operator enables HTTP request logging.
+
+In a shared dossier, a finder can leave an encrypted note with `report --message`.
 Any key holder can reply with `kompromat attach canary.json --message 'Got it'`
 or read the conversation with
 `kompromat unlock canary.json`. The API stores the notes as ciphertext.

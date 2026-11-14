@@ -156,7 +156,7 @@ pub fn generate_private_for_api(
     flag.defender_public_key = Some(defender_public.clone());
     manifest.defender_public_key = Some(defender_public);
 
-    flag.instructions = "Found this flag? Run kompromat report PATH_TO_THIS_FILE --message 'your note'. Keep the finder receipt to read replies. Never upload the flag or the receipt.".into();
+    flag.instructions = "Found this flag? Run kompromat report PATH_TO_THIS_FILE --message 'your write-up'. Keep the local dossier key to read and reply. Never upload the flag or the dossier key.".into();
     // The legacy curl template describes a different endpoint and message format.
     flag.submission = None;
     manifest.metadata.remove("submission");

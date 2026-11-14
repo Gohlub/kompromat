@@ -41,6 +41,22 @@ pub struct Opening {
     pub proof: Proof,
 }
 
+/// The facilitator's durable acceptance record for a single private report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureReceipt {
+    pub dossier_id: String,
+    /// First accepted report for this flag is 1. Retries preserve this value.
+    pub sequence: i64,
+    /// Server UTC time. Older reports predate timestamp collection.
+    pub accepted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcceptedOpening {
+    pub opening: Opening,
+    pub receipt: CaptureReceipt,
+}
+
 pub fn fresh_secret() -> String {
     hex::encode(MiniSecretKey::generate().to_bytes())
 }

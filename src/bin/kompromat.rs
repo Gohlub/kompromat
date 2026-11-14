@@ -56,7 +56,7 @@ enum Command {
         /// Path for the secret key file.
         #[arg(long)]
         out: PathBuf,
-        /// Enable private finder threads; retain this separate secret file off-target.
+        /// Enable per-report dossiers and save the defender key at this new path.
         #[arg(long)]
         defender_out: Option<PathBuf>,
         /// Public metadata as a JSON object; do not include secrets.
@@ -74,13 +74,13 @@ enum Command {
     },
     /// Create a proof locally and print it as JSON. The key stays local.
     Prove(ProofArgs),
-    /// Report a found flag, or retry a saved finder credential.
+    /// Report a captured flag, or resubmit the original report using its dossier key.
     Report {
         #[command(flatten)]
         proof: ProofArgs,
-        /// Save this finder's private thread credential at this new path.
-        #[arg(long)]
-        finder_out: Option<PathBuf>,
+        /// Save the private dossier key at this new path (default: dossier-key-<id>.json).
+        #[arg(long, alias = "finder-out")]
+        dossier_key_out: Option<PathBuf>,
         /// Override the API address in the key file.
         #[arg(long)]
         api: Option<String>,
@@ -100,21 +100,21 @@ enum Command {
     /// Encrypt and sign a message locally, then append it to the dossier.
     Attach {
         key: PathBuf,
-        /// Finder thread to use with a defender credential.
-        #[arg(long)]
-        thread: Option<String>,
+        /// Dossier to reply to with a defender key.
+        #[arg(long, alias = "thread", value_name = "ID")]
+        dossier: Option<String>,
         #[arg(long)]
         message: String,
         /// Override the API address in the key file.
         #[arg(long)]
         api: Option<String>,
     },
-    /// Read messages with a key or list threads with a defender credential.
+    /// Read messages with a key or list capture receipts with a defender key.
     Unlock {
         key: PathBuf,
-        /// Finder thread to read. Omit with a defender credential to list threads.
-        #[arg(long)]
-        thread: Option<String>,
+        /// Dossier to read with a defender key. Omit to list capture receipts.
+        #[arg(long, alias = "thread", value_name = "ID")]
+        dossier: Option<String>,
         /// Override the API address in the key file.
         #[arg(long)]
         api: Option<String>,
@@ -157,13 +157,13 @@ fn main() -> Result<()> {
         Command::Report {
             proof: args,
             api,
-            finder_out,
+            dossier_key_out,
         } => {
             let secret = match read_json(&args.key)? {
                 LocalKey::Private(credential) => {
                     ensure!(
-                        args.message.is_none() && finder_out.is_none(),
-                        "retry the saved report without a new message or --finder-out"
+                        args.message.is_none() && dossier_key_out.is_none(),
+                        "retry the saved report without a new message or --dossier-key-out"
                     );
                     return private::resend(&credential, &args.key, api.as_deref());
                 }
@@ -174,13 +174,13 @@ fn main() -> Result<()> {
                     &secret,
                     defender,
                     args.message.as_deref().unwrap_or_default(),
-                    finder_out,
+                    dossier_key_out,
                     api.as_deref().unwrap_or(&secret.api),
                 );
             }
             ensure!(
-                finder_out.is_none(),
-                "--finder-out requires a private dossier"
+                dossier_key_out.is_none(),
+                "--dossier-key-out requires a private dossier"
             );
             let proof = args.create_proof(&secret)?;
             let url = if let Some(api) = api {
@@ -216,7 +216,7 @@ fn main() -> Result<()> {
         }
         Command::Attach {
             key,
-            thread,
+            dossier,
             message,
             api,
         } => {
@@ -224,7 +224,7 @@ fn main() -> Result<()> {
                 LocalKey::Private(credential) => {
                     return private::attach(
                         &credential,
-                        thread.as_deref(),
+                        dossier.as_deref(),
                         &message,
                         api.as_deref(),
                     );
@@ -233,9 +233,9 @@ fn main() -> Result<()> {
             };
             ensure!(
                 secret.defender_public_key.is_none(),
-                "use a finder or defender credential to attach"
+                "use the dossier key or defender key to attach"
             );
-            ensure!(thread.is_none(), "--thread requires a defender credential");
+            ensure!(dossier.is_none(), "--dossier requires a defender key");
             let entry = encrypt_message(&secret, &message)?;
             print_json(&post(
                 api.as_deref().unwrap_or(&secret.api),
@@ -243,18 +243,18 @@ fn main() -> Result<()> {
                 &entry,
             )?)?;
         }
-        Command::Unlock { key, thread, api } => {
+        Command::Unlock { key, dossier, api } => {
             let secret = match read_json(&key)? {
                 LocalKey::Private(credential) => {
-                    return private::unlock(&credential, thread.as_deref(), api.as_deref());
+                    return private::unlock(&credential, dossier.as_deref(), api.as_deref());
                 }
                 LocalKey::Flag(key) => key,
             };
             ensure!(
                 secret.defender_public_key.is_none(),
-                "use a finder or defender credential to unlock"
+                "use the dossier key or defender key to unlock"
             );
-            ensure!(thread.is_none(), "--thread requires a defender credential");
+            ensure!(dossier.is_none(), "--dossier requires a defender key");
             let public_key = secret.public_key()?;
             let response = client()?
                 .get(format!(
