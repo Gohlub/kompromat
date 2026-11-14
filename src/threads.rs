@@ -10,11 +10,10 @@ use schnorrkel::{ExpansionMode, Keypair, MiniSecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Key, Manifest, Proof, decode, prove, public_key, verify};
+use crate::{Key, MAX_MESSAGE_BYTES, Manifest, Proof, decode, prove, public_key, verify};
 
 const CIPHER_CONTEXT: &[u8] = b"kompromat:finder-dossier:kex:v1";
 const SIGNING_CONTEXT: &[u8] = b"kompromat:finder-dossier:message:v1";
-const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +66,7 @@ pub fn fresh_secret() -> String {
     hex::encode(MiniSecretKey::generate().to_bytes())
 }
 
-fn keypair(secret: &str) -> Result<Keypair> {
+pub(crate) fn keypair(secret: &str) -> Result<Keypair> {
     let seed = MiniSecretKey::from_bytes(&decode::<32>(secret)?).map_err(|e| anyhow!("{e}"))?;
     Ok(seed.expand_to_keypair(ExpansionMode::Ed25519))
 }
@@ -238,8 +237,7 @@ mod tests {
 
     #[test]
     fn each_finder_and_defender_can_read_only_their_exchange() {
-        let (flag, mut manifest, defender) =
-            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
+        let (flag, mut manifest, defender) = crate::generate(Map::new()).unwrap();
 
         let alice = fresh_secret();
         let bob = fresh_secret();
@@ -282,22 +280,20 @@ mod tests {
 
     #[test]
     fn opening_requires_the_private_flag_from_the_registered_hunt() {
-        let (mut flag, manifest, _) =
-            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
+        let (mut flag, manifest, _) = crate::generate(Map::new()).unwrap();
         let finder = fresh_secret();
         let mut other = manifest.clone();
         other.public_key = participant_public(&finder).unwrap();
         assert!(open(&flag, &other, &finder, "").is_err());
         flag.defender_public_key = None;
         assert!(open(&flag, &manifest, &finder, "").is_err());
-        let (shared, shared_manifest) = crate::generate(Map::new());
+        let (shared, shared_manifest) = crate::generate_shared(Map::new());
         assert!(open(&shared, &shared_manifest, &finder, "").is_err());
     }
 
     #[test]
     fn reject_keys_which_collapse_roles_and_invalid_encodings() {
-        let (mut flag, mut manifest, defender) =
-            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
+        let (mut flag, mut manifest, defender) = crate::generate(Map::new()).unwrap();
         let finder = fresh_secret();
         assert!(open(&flag, &manifest, &defender, "").is_err());
         assert!(open(&flag, &manifest, &flag.secret_key, "").is_err());

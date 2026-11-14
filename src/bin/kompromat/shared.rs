@@ -5,24 +5,27 @@ use kompromat::{
 use reqwest::Url;
 use serde_json::{Value, json};
 
-use super::{client, hunt_url, post, post_url, print_json, registered_hunt, response_json_bound};
+use super::{
+    client, hunt_url, post, post_url, print_json, registered_hunt, registry_endpoint, registry_url,
+    response_json_bound,
+};
 
 pub(super) fn report(secret: &Key, api: Option<&str>, proof: &Proof) -> Result<()> {
     let url = if let Some(api) = api {
-        format!("{}/proofs", api.trim_end_matches('/'))
+        registry_endpoint(api, "proofs")?
     } else if let Some(submission) = &secret.submission {
         ensure!(
             submission.method == "POST" && submission.content_type == "application/json",
             "report requires a JSON POST submission"
         );
-        submission.url.clone()
+        registry_url(&submission.url)?
     } else {
-        format!("{}/proofs", secret.api.trim_end_matches('/'))
+        registry_endpoint(&secret.api, "proofs")?
     };
-    submit_proof(&url, proof)
+    submit_proof(url, proof)
 }
 
-pub(super) fn submit_proof(url: &str, proof: &Proof) -> Result<()> {
+pub(super) fn submit_proof(url: Url, proof: &Proof) -> Result<()> {
     let stored: Proof = post_url(url, proof)?;
     ensure!(&stored == proof, "API acknowledged a different proof");
     print_json(&stored)
@@ -69,21 +72,12 @@ pub(super) fn unlock(flag: &Key, hunt: Option<Url>, api: Option<String>, after: 
         api.unwrap_or_else(|| flag.api.clone())
     };
     let response = client()?
-        .get(format!(
-            "{}/dossiers/{public_key}/messages?after={after}",
-            api.trim_end_matches('/')
-        ))
+        .get(registry_endpoint(
+            &api,
+            &format!("dossiers/{public_key}/messages?after={after}"),
+        )?)
         .send()?;
-    let value: Value = response_json_bound(response, 2 * 1024 * 1024)?;
-    let page: Page<Value> = if value.is_array() {
-        ensure!(after == 0, "registry does not support pagination");
-        Page {
-            items: serde_json::from_value(value)?,
-            next_after: None,
-        }
-    } else {
-        serde_json::from_value(value)?
-    };
+    let page: Page<Value> = response_json_bound(response, 2 * 1024 * 1024)?;
     ensure!(
         page.next_after
             .is_none_or(|next| next > after && !page.items.is_empty()),

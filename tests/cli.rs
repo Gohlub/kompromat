@@ -15,7 +15,7 @@ fn cli(dir: &std::path::Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn offline_flow_and_secret_file_protection() {
+fn offline_proof_and_secret_file_protection() {
     let dir = tempdir().unwrap();
     let generated = cli(
         dir.path(),
@@ -69,14 +69,7 @@ fn offline_flow_and_secret_file_protection() {
 
     let proven = cli(
         dir.path(),
-        &[
-            "prove",
-            "secret.json",
-            "--manifest",
-            "manifest.json",
-            "--message",
-            "found it",
-        ],
+        &["prove", "secret.json", "--manifest", "manifest.json"],
     );
     assert!(
         proven.status.success(),
@@ -117,6 +110,72 @@ fn offline_flow_and_secret_file_protection() {
 }
 
 #[test]
+fn manifest_output_is_created_once() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let generate = |flag: &str, defender: &str| {
+        cli(
+            path,
+            &[
+                "generate",
+                "--out",
+                flag,
+                "--defender-out",
+                defender,
+                "--manifest-out",
+                "manifest",
+            ],
+        )
+    };
+    let first = generate("flag", "defender");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stdout.is_empty());
+    let saved = fs::read(path.join("manifest")).unwrap();
+    let manifest: kompromat::Manifest = serde_json::from_slice(&saved).unwrap();
+    let flag: kompromat::Key =
+        serde_json::from_slice(&fs::read(path.join("flag")).unwrap()).unwrap();
+    assert_eq!(manifest.public_key, flag.public_key().unwrap());
+    assert_eq!(manifest.defender_public_key, flag.defender_public_key);
+
+    let collision = generate("another-flag", "another-defender");
+    assert!(!collision.status.success());
+    assert_eq!(fs::read(path.join("manifest")).unwrap(), saved);
+    assert!(!path.join("another-flag").exists());
+    assert!(!path.join("another-defender").exists());
+}
+
+#[test]
+fn generation_errors_preserve_existing_files() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    fs::write(path.join("flag"), "existing flag").unwrap();
+    let collision = cli(path, &["generate", "--out", "flag"]);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(fs::read(path.join("flag")).unwrap(), b"existing flag");
+    assert!(!path.join("defender.json").exists());
+
+    fs::write(path.join("defender.json"), "existing defender").unwrap();
+    let collision = cli(path, &["generate", "--out", "new-flag"]);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(
+        fs::read(path.join("defender.json")).unwrap(),
+        b"existing defender"
+    );
+    assert!(!path.join("new-flag").exists());
+
+    let shared = cli(path, &["generate", "--out", "new-flag", "--shared"]);
+    assert!(!shared.status.success());
+    assert!(String::from_utf8_lossy(&shared.stderr).contains("--shared"));
+    assert!(!path.join("new-flag").exists());
+}
+
+#[test]
 fn flag_input_must_be_a_regular_file_under_the_limit() {
     let dir = tempdir().unwrap();
     fs::File::create(dir.path().join("oversize"))
@@ -140,11 +199,11 @@ async fn shared_writes_reject_unrelated_acknowledgments() {
         Json, Router,
         routing::{get, post},
     };
-    use kompromat::{Proof, encrypt_message, generate, prove};
+    use kompromat::{Proof, encrypt_message, generate_shared, prove};
     use serde_json::json;
 
     let dir = tempdir().unwrap();
-    let (key, manifest) = generate(Default::default());
+    let (key, manifest) = generate_shared(Default::default());
     let proof = prove(&key, "offline claim".into()).unwrap();
     fs::write(dir.path().join("flag"), serde_json::to_vec(&key).unwrap()).unwrap();
     fs::write(

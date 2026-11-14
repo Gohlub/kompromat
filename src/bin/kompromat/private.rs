@@ -4,8 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use kompromat::publication::{self, Listing, PublicationState};
 use kompromat::{
-    Key, Manifest, generate_private_for_api,
+    Key, Manifest, generate_for_api,
     threads::{self, AcceptedOpening, CaptureReceipt, Opening, Page, Participants, ThreadMessage},
     validate_public_key,
 };
@@ -14,7 +15,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 use super::{
-    client, hunt_base, post, print_json, registered_hunt, response_json_bound, write_secret,
+    client, hunt_base, post, print_json, registered_hunt, registry_base, registry_endpoint,
+    response_json_bound, write_new_json,
 };
 
 // A full page holds up to 50 messages of 16 KiB each, encoded as hex.
@@ -50,7 +52,7 @@ impl Credential {
         let base = match self {
             Self::Defender { api, .. } => {
                 ensure!(hunt.is_none(), "the defender key already selects its hunt");
-                api.clone()
+                registry_base(api)?
             }
             Self::Finder {
                 opening,
@@ -70,10 +72,12 @@ impl Credential {
                 }
             }
         };
-        ensure!(
-            requested.is_none_or(|url| url.trim_end_matches('/') == base.trim_end_matches('/')),
-            "API differs from the selected facilitator"
-        );
+        if let Some(url) = requested {
+            ensure!(
+                registry_base(url)? == base,
+                "API differs from the selected facilitator"
+            );
+        }
         Ok(base)
     }
 
@@ -130,22 +134,66 @@ impl Credential {
 pub(super) fn generate(
     flag_path: &Path,
     defender_path: &Path,
+    manifest_path: Option<&Path>,
     metadata: Map<String, Value>,
     api: &str,
 ) -> Result<()> {
-    let (flag, manifest, secret) = generate_private_for_api(metadata, api)?;
+    ensure!(
+        flag_path != defender_path,
+        "choose a different --defender-out path from the flag"
+    );
+    let (flag, manifest, secret) = generate_for_api(metadata, api)?;
     let credential = Credential::Defender {
         flag: manifest.public_key.clone(),
         secret,
         api: api.into(),
     };
-    write_secret(defender_path, &credential)?;
-    if let Err(error) = write_secret(flag_path, &flag) {
-        fs::remove_file(defender_path)
-            .context("could not roll back newly created defender file")?;
+    let mut created = Vec::new();
+    let save = (|| -> Result<()> {
+        write_new_json(defender_path, &credential)
+            .context("choose an unused, writable path for the defender key with --defender-out")?;
+        created.push(defender_path);
+        write_new_json(flag_path, &flag)?;
+        created.push(flag_path);
+        if let Some(path) = manifest_path {
+            write_new_json(path, &manifest)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = save {
+        for path in created.into_iter().rev() {
+            fs::remove_file(path)
+                .with_context(|| format!("{error:#}; could not remove {}", path.display()))?;
+        }
         return Err(error);
     }
-    print_json(&manifest)
+    eprintln!(
+        "Keep {} private. Plant only {}.",
+        defender_path.display(),
+        flag_path.display()
+    );
+    if manifest_path.is_none() {
+        print_json(&manifest)?;
+    }
+    Ok(())
+}
+
+pub(super) fn publication(key: &Path, listing: Option<Listing>) -> Result<()> {
+    let credential: Credential = super::read_json(key)?;
+    let Credential::Defender { flag, secret, .. } = &credential else {
+        bail!("publication requires a defender key");
+    };
+    validate_public_key(flag)?;
+    let api = credential.api(None, None)?;
+    let path = format!("dossiers/{flag}/publication");
+    let current: PublicationState = get(&api, &path)?;
+    let change = publication::sign(secret, flag, &current, listing)?;
+    let accepted: PublicationState = post(&api, &path, &change)?;
+    ensure!(
+        accepted == change.state,
+        "API acknowledged a different publication"
+    );
+    print_json(&accepted)
 }
 
 pub(super) fn report(
@@ -165,7 +213,7 @@ pub(super) fn report(
         _legacy_api: None,
         hunt: Some(hunt.into()),
     };
-    write_secret(&path, &credential)?;
+    write_new_json(&path, &credential)?;
     resend(&credential, &path, None, None)
 }
 
@@ -179,19 +227,22 @@ pub(super) fn resend(
         bail!("report requires a flag or a saved dossier key");
     };
     threads::verify_opening(opening, &credential.manifest()?)?;
-    let acknowledgement: AcceptedOpening = post(&credential.api(api, hunt)?, "report", opening)
+    let acknowledgement = post::<AcceptedOpening>(&credential.api(api, hunt)?, "report", opening)
+        .and_then(|ack| {
+            ensure!(
+                ack.opening == **opening
+                    && ack.receipt.dossier_id == opening.participants.finder
+                    && ack.receipt.sequence > 0,
+                "API acknowledged a different opening"
+            );
+            Ok(ack)
+        })
         .with_context(|| {
             format!(
                 "dossier key saved at {}; retry with report and that file",
                 path.display()
             )
         })?;
-    ensure!(
-        acknowledgement.opening == **opening
-            && acknowledgement.receipt.dossier_id == opening.participants.finder
-            && acknowledgement.receipt.sequence > 0,
-        "API acknowledged a different opening"
-    );
     print_json(&json!({
         "receipt": acknowledgement.receipt,
         "dossier_key_file": path,
@@ -293,9 +344,7 @@ pub(super) fn attach(
 }
 
 fn get<T: DeserializeOwned>(api: &str, path: &str) -> Result<T> {
-    let response = client()?
-        .get(format!("{}/{path}", api.trim_end_matches('/')))
-        .send()?;
+    let response = client()?.get(registry_endpoint(api, path)?).send()?;
     response_json_bound(response, MAX_RESPONSE_BYTES)
 }
 
@@ -316,7 +365,7 @@ mod tests {
 
     #[test]
     fn transcript_attributes_only_verified_entries_and_preserves_readable_neighbors() {
-        let (flag, manifest, defender) = generate_private_for_api(Map::new(), "unused").unwrap();
+        let (flag, manifest, defender) = generate_for_api(Map::new(), "unused").unwrap();
         let finder = threads::fresh_secret();
         let opening = threads::open(&flag, &manifest, &finder, "first").unwrap();
         let p = &opening.participants;

@@ -223,7 +223,7 @@ async fn list(
         &connection,
         "SELECT sequence, finder, accepted_at FROM finder_threads
          WHERE flag = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
-        &flag,
+        |after, limit| (flag.as_str(), after, limit),
         |row| {
             Ok(CaptureReceipt {
                 dossier_id: row.get(1)?,
@@ -304,7 +304,7 @@ async fn messages(
         &connection,
         "SELECT sequence, document FROM thread_entries
          WHERE finder = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
-        &finder,
+        |after, limit| (finder.as_str(), after, limit),
         |row| read_json(row, 1),
     )
 }

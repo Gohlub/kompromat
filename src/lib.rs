@@ -2,6 +2,7 @@
 
 pub mod api;
 mod messages;
+pub mod publication;
 pub mod threads;
 
 pub use messages::{EncryptedMessage, decrypt_message, encrypt_message, verify_message};
@@ -15,7 +16,9 @@ use serde_json::{Map, Value};
 const CONTEXT: &[u8] = b"kompromat:proof:v1";
 const REPLY_CONTEXT: &[u8] = b"kompromat:proof-reply:v1";
 pub const DEFAULT_API: &str = "http://127.0.0.1:3000";
-const PRIVATE_REPORTING_INSTRUCTIONS: &str = "Run kompromat report PATH_TO_THIS_FILE --hunt HUNT_URL --message 'your write-up'. Use the hunt URL from the registry. Keep the dossier key to read and reply.";
+/// Maximum UTF-8 plaintext size for an encrypted note.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const PRIVATE_REPORTING_INSTRUCTIONS: &str = "Keep this file and its secret local. Use the registry's hunt URL with `kompromat report PATH_TO_THIS_FILE --hunt HUNT_URL --message-stdin < writeup.txt`. Save the dossier key to read and reply.";
 
 fn default_api() -> String {
     DEFAULT_API.into()
@@ -60,7 +63,7 @@ impl Submission {
 #[serde(deny_unknown_fields)]
 pub struct Key {
     pub secret_key: String,
-    /// Recipient pinned in a planted flag when private finder dossiers are enabled.
+    /// Pins the defender who receives private reports. Shared-format flags omit this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defender_public_key: Option<String>,
     #[serde(default = "default_api")]
@@ -120,16 +123,13 @@ pub struct Proof {
     pub reply: Option<EncryptedMessage>,
 }
 
-pub fn generate(metadata: Map<String, Value>) -> (Key, Manifest) {
+/// Generate a flag, its public manifest, and the defender key for reading reports.
+pub fn generate(metadata: Map<String, Value>) -> Result<(Key, Manifest, String)> {
     generate_for_api(metadata, DEFAULT_API)
 }
 
-pub fn generate_for_api(metadata: Map<String, Value>, api: &str) -> (Key, Manifest) {
-    generate_flag(metadata, api, None)
-}
-
-/// Generate a planted flag and a separate, defender-only credential.
-pub fn generate_private_for_api(
+/// Generate the same keys and manifest with the supplied registry URL.
+pub fn generate_for_api(
     metadata: Map<String, Value>,
     api: &str,
 ) -> Result<(Key, Manifest, String)> {
@@ -140,6 +140,15 @@ pub fn generate_private_for_api(
     let (secret, public) = generate_keypair();
     let (flag, manifest) = generate_flag(metadata, api, Some(public));
     Ok((flag, manifest, secret))
+}
+
+/// Generate a shared dossier readable by everyone who holds its flag.
+pub fn generate_shared(metadata: Map<String, Value>) -> (Key, Manifest) {
+    generate_shared_for_api(metadata, DEFAULT_API)
+}
+
+pub fn generate_shared_for_api(metadata: Map<String, Value>, api: &str) -> (Key, Manifest) {
+    generate_flag(metadata, api, None)
 }
 
 fn generate_keypair() -> (String, String) {
@@ -276,7 +285,10 @@ mod tests {
     fn private_manifest_preserves_the_brief_and_omits_shared_submission() {
         let mut metadata = Map::new();
         metadata.insert("instructions".into(), Value::String("hunt brief".into()));
-        let (flag, manifest, _) = generate_private_for_api(metadata, DEFAULT_API).unwrap();
+        let (flag, manifest, defender_secret) = generate(metadata).unwrap();
+        let defender = threads::participant_public(&defender_secret).unwrap();
+        assert_eq!(flag.defender_public_key.as_ref(), Some(&defender));
+        assert_eq!(manifest.defender_public_key.as_ref(), Some(&defender));
         assert_eq!(manifest.metadata["instructions"], "hunt brief");
         assert_eq!(flag.instructions, PRIVATE_REPORTING_INSTRUCTIONS);
         assert!(!manifest.metadata.contains_key("submission"));
@@ -285,7 +297,7 @@ mod tests {
 
     #[test]
     fn proof_roundtrip_keeps_secret_local() {
-        let (key, public) = generate(Map::new());
+        let (key, public, _) = generate(Map::new()).unwrap();
         let proof = prove(&key, "found in the archive".into()).unwrap();
         let json = serde_json::to_string(&proof).unwrap();
         let restored: Proof = serde_json::from_str(&json).unwrap();
@@ -304,7 +316,7 @@ mod tests {
 
     #[test]
     fn tampering_and_wrong_manifests_fail() {
-        let (key, public) = generate(Map::new());
+        let (key, public, _) = generate(Map::new()).unwrap();
         let proof = prove(&key, "original".into()).unwrap();
         let mut changed = proof.clone();
         changed.message.push('!');
@@ -319,7 +331,7 @@ mod tests {
             },
         );
         assert!(verify(&changed, &public).is_err());
-        let (_, other) = generate(Map::new());
+        let (_, other, _) = generate(Map::new()).unwrap();
         assert!(verify(&proof, &other).is_err());
         changed = proof;
         changed.public_key = other.public_key.clone();
@@ -365,8 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn private_reply_is_bound_to_the_proof_and_stays_encrypted() {
-        let (key, public) = generate(Map::new());
+    fn shared_reply_is_bound_to_the_proof_and_stays_encrypted() {
+        let (key, public) = generate_shared(Map::new());
         let proof = prove_with_reply(&key, "I found it".into(), "The private details").unwrap();
         verify(&proof, &public).unwrap();
         assert_eq!(
@@ -393,7 +405,7 @@ mod tests {
         assert!(verify(&legacy, &public).is_err());
 
         // Even a valid outer signature cannot authorize a reply for another key.
-        let (other, _) = generate(Map::new());
+        let (other, _) = generate_shared(Map::new());
         let wrong_key = sign_proof(
             &key,
             String::new(),

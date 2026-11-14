@@ -1,5 +1,6 @@
 //! An HTTP registry for public manifests, proofs of key possession, and encrypted messages.
 
+mod publication;
 mod threads;
 
 use std::sync::{Arc, Mutex};
@@ -11,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::threads::Page;
 use crate::{EncryptedMessage, Manifest, Proof, validate_public_key, verify, verify_message};
@@ -63,6 +64,7 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
     )?;
 
     threads::initialize(&connection)?;
+    publication::initialize(&connection)?;
     Ok(Router::new()
         .route(
             "/cli",
@@ -89,6 +91,7 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
         .route("/canaries/{public_key}/record", get(list_messages))
         .route("/records", post(append_message))
         .merge(threads::routes())
+        .merge(publication::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Mutex::new(connection))))
 }
@@ -128,6 +131,7 @@ async fn register(
     Json(manifest): Json<Manifest>,
 ) -> Result<(StatusCode, Json<Manifest>), ApiError> {
     validate_public_key(&manifest.public_key).map_err(bad_request)?;
+    // TODO: Remove support for shared-format hunts and require a defender key on every registration.
     if let Some(defender) = manifest.defender_public_key.as_deref() {
         validate_public_key(defender).map_err(bad_request)?;
         if defender == manifest.public_key {
@@ -225,11 +229,11 @@ struct PageQuery {
 }
 
 impl PageQuery {
-    fn read<T>(
+    fn read<T, P: rusqlite::Params>(
         &self,
         connection: &Connection,
         sql: &str,
-        key: &str,
+        bind: impl FnOnce(i64, u32) -> P,
         item: impl Fn(&Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<Json<Page<T>>, ApiError> {
         const MAX_PAGE: u32 = 50;
@@ -241,9 +245,7 @@ impl PageQuery {
             ));
         }
         let mut statement = connection.prepare(sql).map_err(internal)?;
-        let mut rows = statement
-            .query(params![key, after, limit + 1])
-            .map_err(internal)?;
+        let mut rows = statement.query(bind(after, limit + 1)).map_err(internal)?;
         let mut items = Vec::new();
         let mut last = None;
         while let Some(row) = rows.next().map_err(internal)? {
@@ -270,41 +272,27 @@ fn read_json<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlite::Res
     })
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum History<T> {
-    All(Vec<T>),
-    Page(Page<T>),
-}
-
 fn history<T: DeserializeOwned>(
     database: &Database,
     key: &str,
     query: PageQuery,
     sql: &str,
-) -> Result<Json<History<T>>, ApiError> {
+) -> Result<Json<Page<T>>, ApiError> {
     let connection = database.lock().map_err(internal)?;
     find_manifest(&connection, key)?;
-    if query.after.is_some() || query.limit.is_some() {
-        let Json(page) = query.read(&connection, sql, key, |row| read_json(row, 1))?;
-        return Ok(Json(History::Page(page)));
-    }
-
-    // The original API returns the whole history as an array. In SQLite LIMIT -1 is unlimited.
-    let mut statement = connection.prepare(sql).map_err(internal)?;
-    let items = statement
-        .query_map(params![key, 0, -1], |row| read_json(row, 1))
-        .map_err(internal)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(internal)?;
-    Ok(Json(History::All(items)))
+    query.read(
+        &connection,
+        sql,
+        |after, limit| (key, after, limit),
+        |row| read_json(row, 1),
+    )
 }
 
 async fn list_proofs(
     State(database): State<Database>,
     Path(public_key): Path<String>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<History<Proof>>, ApiError> {
+) -> Result<Json<Page<Proof>>, ApiError> {
     history(
         &database,
         &public_key,
@@ -369,7 +357,7 @@ async fn list_messages(
     State(database): State<Database>,
     Path(public_key): Path<String>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<History<EncryptedMessage>>, ApiError> {
+) -> Result<Json<Page<EncryptedMessage>>, ApiError> {
     history(
         &database,
         &public_key,
@@ -389,7 +377,9 @@ mod tests {
     use serde_json::{Map, Value, json};
     use tower::ServiceExt;
 
-    use crate::{decrypt_message, encrypt_message, generate, prove, prove_with_reply};
+    use crate::{decrypt_message, encrypt_message, generate_shared, prove, prove_with_reply};
+
+    const EMPTY_PAGE: &str = r#"{"items":[],"next_after":null}"#;
 
     #[tokio::test]
     async fn cli_endpoint_serves_installer_with_configured_release_host() {
@@ -459,8 +449,7 @@ mod tests {
 
         let file = tempfile::NamedTempFile::new().unwrap();
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
-        let (mut flag, manifest, defender) =
-            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
+        let (mut flag, manifest, defender) = crate::generate(Map::new()).unwrap();
         for invalid in ["not a key".to_owned(), manifest.public_key.clone()] {
             let mut changed = manifest.clone();
             changed.defender_public_key = Some(invalid);
@@ -528,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             read(&router, &format!("{route}/proofs")).await,
-            json!(proofs)
+            json!({"items": proofs, "next_after": null})
         );
 
         let entries = format!("/threads/{}/messages", alice_report.participants.finder);
@@ -607,7 +596,12 @@ mod tests {
         assert!(insert_proof(&db, &bare).unwrap());
         let reopened = app(db).unwrap();
         let old_proofs = read(&reopened, &format!("{route}/proofs")).await;
-        assert!(old_proofs.as_array().unwrap().contains(&json!(bare)));
+        assert!(
+            old_proofs["items"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(bare))
+        );
         assert_eq!(
             read(&reopened, &format!("{route}/threads?limit=1")).await,
             json!({"items": [accepted[0]], "next_after": 1})
@@ -643,8 +637,156 @@ mod tests {
         );
         assert_eq!(
             read(&reopened, &format!("{route}/messages")).await,
-            json!([])
+            json!({"items": [], "next_after": null})
         );
+    }
+
+    #[tokio::test]
+    async fn only_current_defender_authorizations_change_the_public_directory() {
+        use crate::publication::{Listing, PublicationState, sign};
+
+        async fn get(router: &Router, path: &str) -> Value {
+            let (status, body) = request(router, Method::GET, path, None).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_str(&body).unwrap()
+        }
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let router = app(Connection::open(file.path()).unwrap()).unwrap();
+        let other_registry = app(Connection::open_in_memory().unwrap()).unwrap();
+        let (flag, hunt, defender) = crate::generate(Map::new()).unwrap();
+        let (_, mut second, _) = crate::generate(Map::new()).unwrap();
+        // The same defender may legitimately control multiple hunts.
+        second.defender_public_key = hunt.defender_public_key.clone();
+        let (_, shared) = generate_shared(Map::new());
+        for manifest in [&hunt, &second, &shared] {
+            assert_eq!(
+                request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
+                    .await
+                    .0,
+                StatusCode::CREATED
+            );
+        }
+        request(
+            &other_registry,
+            Method::POST,
+            "/dossiers",
+            Some(json!(hunt)),
+        )
+        .await;
+        assert_eq!(
+            get(&router, "/hunts").await,
+            json!({"items": [], "next_after": null})
+        );
+        let (_, html) = request(&router, Method::GET, "/", None).await;
+        assert!(html.contains("No listings on this page."));
+        let route = format!("/dossiers/{}/publication", hunt.public_key);
+        let second_route = format!("/dossiers/{}/publication", second.public_key);
+        let shared_route = format!("/dossiers/{}/publication", shared.public_key);
+        let initial: PublicationState = serde_json::from_value(get(&router, &route).await).unwrap();
+        assert_eq!(initial.revision, 0);
+        assert!(initial.listing.is_none());
+        let brief = Listing {
+            title: "Open <hunt>".into(),
+            brief_url: "https://def.example/terms?a=1&b=2".into(),
+        };
+        let publish = sign(&defender, &hunt.public_key, &initial, Some(brief.clone())).unwrap();
+        let wrong_key = sign(
+            &flag.secret_key,
+            &hunt.public_key,
+            &initial,
+            Some(brief.clone()),
+        )
+        .unwrap();
+        let mut changed = publish.clone();
+        changed.state.listing.as_mut().unwrap().title = "Changed".into();
+        let mut skipped = initial.clone();
+        skipped.revision += 1;
+        let out_of_order =
+            sign(&defender, &hunt.public_key, &skipped, Some(brief.clone())).unwrap();
+        for (service, path, command, expected) in [
+            (&router, &route, &wrong_key, StatusCode::BAD_REQUEST),
+            (&router, &route, &changed, StatusCode::BAD_REQUEST),
+            (&router, &route, &out_of_order, StatusCode::CONFLICT),
+            (&router, &second_route, &publish, StatusCode::BAD_REQUEST),
+            (&router, &shared_route, &publish, StatusCode::BAD_REQUEST),
+            (&other_registry, &route, &publish, StatusCode::CONFLICT),
+            (&router, &route, &publish, StatusCode::OK),
+            (&router, &route, &publish, StatusCode::CONFLICT),
+        ] {
+            assert_eq!(
+                request(service, Method::POST, path, Some(json!(command)))
+                    .await
+                    .0,
+                expected
+            );
+        }
+        let entry = json!({
+            "title": brief.title,
+            "brief_url": brief.brief_url,
+            "hunt": format!("dossiers/{}", hunt.public_key)
+        });
+        assert_eq!(
+            get(&router, "/hunts").await,
+            json!({"items": [entry], "next_after": null})
+        );
+        let (_, html) = request(&router, Method::GET, "/", None).await;
+        assert!(html.contains("Open &lt;hunt&gt;"));
+        assert!(html.contains("https://def.example/terms?a=1&amp;b=2"));
+        assert!(html.contains(&format!("href=\"dossiers/{}\"", hunt.public_key)));
+        assert!(!html.contains(&second.public_key));
+        let nested = Router::new().nest("/games/registry", router.clone());
+        let (status, nested_html) = request(&nested, Method::GET, "/games/registry", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(nested_html.contains(&format!("href=\"./registry/dossiers/{}\"", hunt.public_key)));
+        assert!(nested_html.contains("href=\"./registry/hunts\""));
+
+        let second_publish =
+            sign(&defender, &second.public_key, &initial, Some(brief.clone())).unwrap();
+        assert_eq!(
+            request(
+                &router,
+                Method::POST,
+                &second_route,
+                Some(json!(second_publish))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let first_page = get(&router, "/hunts?limit=1").await;
+        assert_eq!(first_page["items"], json!([entry]));
+        let after = first_page["next_after"].as_i64().unwrap();
+        let second_page = get(&router, &format!("/hunts?after={after}&limit=1")).await;
+        assert_eq!(
+            second_page["items"][0]["hunt"],
+            format!("dossiers/{}", second.public_key)
+        );
+        assert_eq!(second_page["next_after"], Value::Null);
+        let (_, html) = request(&router, Method::GET, "/?limit=1", None).await;
+        assert!(html.contains(&format!("?after={after}&amp;limit=1")));
+
+        let withdraw = sign(&defender, &hunt.public_key, &publish.state, None).unwrap();
+        assert_eq!(
+            request(&router, Method::POST, &route, Some(json!(withdraw)))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        drop(router);
+        let reopened = app(Connection::open(file.path()).unwrap()).unwrap();
+        assert_eq!(get(&reopened, &route).await, json!(withdraw.state));
+        assert_eq!(
+            request(&reopened, Method::POST, &route, Some(json!(publish)))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(get(&reopened, "/hunts").await, second_page);
+        for manifest in [&hunt, &second] {
+            let path = format!("/dossiers/{}", manifest.public_key);
+            assert_eq!(get(&reopened, &path).await, json!(manifest));
+        }
     }
 
     #[tokio::test]
@@ -655,7 +797,7 @@ mod tests {
             "defender_public_key".into(),
             json!("legacy application data"),
         );
-        let (flag, manifest) = generate(metadata);
+        let (flag, manifest) = generate_shared(metadata);
         let proof = prove_with_reply(&flag, String::new(), "shared note").unwrap();
         for (uri, body) in [("/dossiers", json!(manifest)), ("/proofs", json!(proof))] {
             assert_eq!(
@@ -666,9 +808,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_history_returns_the_full_array_unless_paging_is_requested() {
+    async fn shared_history_is_bounded_even_without_a_query() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let (key, manifest) = generate(Map::new());
+        let (key, manifest) = generate_shared(Map::new());
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
         assert_eq!(
             request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
@@ -694,14 +836,7 @@ mod tests {
             (format!("/dossiers/{flag}/messages"), &messages),
             (format!("/canaries/{flag}/record"), &messages),
         ] {
-            let (status, body) = request(&router, Method::GET, &route, None).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(
-                &serde_json::from_str::<Vec<Value>>(&body).unwrap(),
-                expected
-            );
-            let (status, page) =
-                request(&router, Method::GET, &format!("{route}?after=0"), None).await;
+            let (status, page) = request(&router, Method::GET, &route, None).await;
             assert_eq!(status, StatusCode::OK);
             let page: crate::threads::Page<Value> = serde_json::from_str(&page).unwrap();
             assert_eq!(page.items, expected[..50]);
@@ -719,7 +854,7 @@ mod tests {
     async fn registry_and_proofs_are_persistent_and_idempotent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         let proof = prove(&secret, "found it".into()).unwrap();
         for (route, document) in [("/dossiers", json!(dossier)), ("/proofs", json!(proof))] {
             for status in [StatusCode::CREATED, StatusCode::OK] {
@@ -755,14 +890,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_str::<Value>(&document).unwrap(),
-            json!([proof])
+            json!({"items": [proof], "next_after": null})
         );
     }
 
     #[tokio::test]
     async fn rejects_unknown_dossiers_tampering_and_secret_fields() {
         let router = app(Connection::open_in_memory().unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         let proof = prove(&secret, "original".into()).unwrap();
         assert_eq!(
             request(&router, Method::POST, "/proofs", Some(json!(proof)))
@@ -840,19 +975,19 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(stored, "[]");
+        assert_eq!(stored, EMPTY_PAGE);
     }
 
     #[tokio::test]
     async fn messages_are_encrypted_persistent_and_idempotent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         let route = format!("/dossiers/{}/messages", dossier.public_key);
         request(&router, Method::POST, "/dossiers", Some(json!(dossier))).await;
         assert_eq!(
             request(&router, Method::GET, &route, None).await,
-            (StatusCode::OK, "[]".into())
+            (StatusCode::OK, EMPTY_PAGE.into())
         );
 
         let message = "private evidence: key found inside the backup";
@@ -928,7 +1063,9 @@ mod tests {
         let reopened = app(Connection::open(file.path()).unwrap()).unwrap();
         let (status, response) = request(&reopened, Method::GET, &route, None).await;
         assert_eq!(status, StatusCode::OK);
-        let entries: Vec<EncryptedMessage> = serde_json::from_str(&response).unwrap();
+        let entries = serde_json::from_str::<Page<EncryptedMessage>>(&response)
+            .unwrap()
+            .items;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].signature, entry.signature);
         assert_eq!(decrypt_message(&secret, &entries[0]).unwrap(), message);
@@ -943,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn message_writes_require_valid_message_signatures() {
         let router = app(Connection::open_in_memory().unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         let entry = encrypt_message(&secret, "private message").unwrap();
         let route = format!("/dossiers/{}/messages", dossier.public_key);
         assert_eq!(
@@ -956,7 +1093,7 @@ mod tests {
             request(&router, Method::GET, &route, None).await.0,
             StatusCode::NOT_FOUND
         );
-        let (_, other) = generate(Map::new());
+        let (_, other) = generate_shared(Map::new());
         for public in [&dossier, &other] {
             request(&router, Method::POST, "/dossiers", Some(json!(public))).await;
         }
@@ -1014,14 +1151,17 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY
             );
         }
-        assert_eq!(request(&router, Method::GET, &route, None).await.1, "[]");
+        assert_eq!(
+            request(&router, Method::GET, &route, None).await.1,
+            EMPTY_PAGE
+        );
     }
 
     #[tokio::test]
     async fn proof_and_encrypted_reply_are_persisted_together() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         request(&router, Method::POST, "/dossiers", Some(json!(dossier))).await;
         let private = "private reply: the key was in the backup";
         let proof = prove_with_reply(&secret, "found it".into(), private).unwrap();
@@ -1047,11 +1187,13 @@ mod tests {
         let (_, proofs) = request(&reopened, Method::GET, &format!("{base}/proofs"), None).await;
         assert_eq!(
             serde_json::from_str::<Value>(&proofs).unwrap(),
-            json!([proof])
+            json!({"items": [proof], "next_after": null})
         );
         let (_, response) =
             request(&reopened, Method::GET, &format!("{base}/messages"), None).await;
-        let entries: Vec<EncryptedMessage> = serde_json::from_str(&response).unwrap();
+        let entries = serde_json::from_str::<Page<EncryptedMessage>>(&response)
+            .unwrap()
+            .items;
         assert_eq!(entries.len(), 1);
         assert_eq!(decrypt_message(&secret, &entries[0]).unwrap(), private);
         assert!(!response.contains(private));
@@ -1060,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn changed_replies_cannot_be_submitted_with_a_proof() {
         let router = app(Connection::open_in_memory().unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         request(&router, Method::POST, "/dossiers", Some(json!(dossier))).await;
         let proof = prove_with_reply(&secret, "found it".into(), "original private reply").unwrap();
         let mut stripped = proof.clone();
@@ -1079,14 +1221,17 @@ mod tests {
         }
         for suffix in ["proofs", "messages"] {
             let route = format!("/dossiers/{}/{suffix}", dossier.public_key);
-            assert_eq!(request(&router, Method::GET, &route, None).await.1, "[]");
+            assert_eq!(
+                request(&router, Method::GET, &route, None).await.1,
+                EMPTY_PAGE
+            );
         }
     }
 
     #[tokio::test]
     async fn reply_nonce_conflict_rolls_back_proof_insertion() {
         let router = app(Connection::open_in_memory().unwrap()).unwrap();
-        let (secret, dossier) = generate(Map::new());
+        let (secret, dossier) = generate_shared(Map::new());
         request(&router, Method::POST, "/dossiers", Some(json!(dossier))).await;
         let proof = prove_with_reply(&secret, "found it".into(), "private reply").unwrap();
         verify(&proof, &dossier).unwrap();
@@ -1126,19 +1271,19 @@ mod tests {
             request(&router, Method::GET, &format!("{base}/proofs"), None)
                 .await
                 .1,
-            "[]"
+            EMPTY_PAGE
         );
         let (_, response) = request(&router, Method::GET, &format!("{base}/messages"), None).await;
         assert_eq!(
             serde_json::from_str::<Value>(&response).unwrap(),
-            json!([existing])
+            json!({"items": [existing], "next_after": null})
         );
     }
 
     #[tokio::test]
     async fn legacy_routes_share_dossiers_and_messages() {
         let router = app(Connection::open_in_memory().unwrap()).unwrap();
-        let (key, dossier) = generate(Map::new());
+        let (key, dossier) = generate_shared(Map::new());
         assert_eq!(
             request(&router, Method::POST, "/canaries", Some(json!(dossier)))
                 .await
@@ -1171,7 +1316,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(
                 serde_json::from_str::<Value>(&response).unwrap(),
-                json!([message])
+                json!({"items": [message], "next_after": null})
             );
         }
     }
