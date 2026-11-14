@@ -4,28 +4,28 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::{
     ApiError, Database, PageQuery, bad_request, find_manifest, internal, read_json,
     registered_manifest,
 };
-use crate::threads::{
-    AcceptedOpening, CaptureReceipt, Opening, Page, ThreadMessage, verify_entry, verify_opening,
+use crate::dossiers::{
+    AcceptedOpening, CaptureReceipt, DossierMessage, Opening, Page, verify_entry, verify_opening,
 };
 
 pub(super) fn initialize(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS finder_threads (
+        "CREATE TABLE IF NOT EXISTS dossiers (
             finder TEXT PRIMARY KEY,
-            flag TEXT NOT NULL REFERENCES canaries(public_key),
+            flag TEXT NOT NULL REFERENCES hunts(public_key),
             document TEXT NOT NULL,
             sequence INTEGER NOT NULL CHECK (sequence > 0),
             accepted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             UNIQUE (flag, sequence)
          );
-         CREATE TABLE IF NOT EXISTS thread_entries (
-            finder TEXT NOT NULL REFERENCES finder_threads(finder),
+         CREATE TABLE IF NOT EXISTS dossier_messages (
+            finder TEXT NOT NULL REFERENCES dossiers(finder),
             nonce TEXT NOT NULL,
             document TEXT NOT NULL,
             sequence INTEGER NOT NULL CHECK (sequence > 0),
@@ -38,9 +38,9 @@ pub(super) fn initialize(connection: &Connection) -> rusqlite::Result<()> {
 pub(super) fn routes() -> Router<Database> {
     Router::new()
         .route("/report", post(open))
-        .route("/dossiers/{public_key}/threads", get(list))
-        .route("/threads/{finder}", get(get_thread))
-        .route("/threads/{finder}/messages", get(messages).post(append))
+        .route("/hunts/{flag}/dossiers", get(list))
+        .route("/dossiers/{id}", get(get_dossier))
+        .route("/dossiers/{id}/messages", get(messages).post(append))
 }
 
 async fn open(
@@ -50,15 +50,12 @@ async fn open(
     let manifest = registered_manifest(&database, &opening.participants.flag)?;
     verify_opening(&opening, &manifest).map_err(bad_request)?;
 
-    let mut connection = database.lock().map_err(internal)?;
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal)?;
-    let inserted = tx
+    let connection = database.lock().map_err(internal)?;
+    let inserted = connection
         .execute(
-            "INSERT INTO finder_threads (finder, flag, document, sequence)
+            "INSERT INTO dossiers (finder, flag, document, sequence)
              VALUES (?1, ?2, ?3,
-                 (SELECT coalesce(max(sequence), 0) + 1 FROM finder_threads WHERE flag = ?2))
+                 (SELECT coalesce(max(sequence), 0) + 1 FROM dossiers WHERE flag = ?2))
              ON CONFLICT (finder) DO NOTHING",
             params![
                 opening.participants.finder,
@@ -67,16 +64,15 @@ async fn open(
             ],
         )
         .map_err(internal)?;
-    let accepted = find_thread(&tx, &opening.participants.finder)?;
+    let accepted = find_dossier(&connection, &opening.participants.finder)?;
     let status = if inserted == 1 {
         StatusCode::CREATED
     } else {
         if accepted.opening != opening {
-            return Err((StatusCode::CONFLICT, "finder already has a thread".into()));
+            return Err((StatusCode::CONFLICT, "finder already has a dossier".into()));
         }
         StatusCode::OK
     };
-    tx.commit().map_err(internal)?;
     Ok((status, Json(accepted)))
 }
 
@@ -92,24 +88,24 @@ fn read_opening(row: &Row<'_>) -> rusqlite::Result<AcceptedOpening> {
     })
 }
 
-fn find_thread(connection: &Connection, finder: &str) -> Result<AcceptedOpening, ApiError> {
+fn find_dossier(connection: &Connection, finder: &str) -> Result<AcceptedOpening, ApiError> {
     connection
         .query_row(
-            "SELECT document, sequence, accepted_at FROM finder_threads WHERE finder = ?1",
+            "SELECT document, sequence, accepted_at FROM dossiers WHERE finder = ?1",
             [finder],
             read_opening,
         )
         .optional()
         .map_err(internal)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown finder thread".into()))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown dossier".into()))
 }
 
-async fn get_thread(
+async fn get_dossier(
     State(database): State<Database>,
     Path(finder): Path<String>,
 ) -> Result<Json<AcceptedOpening>, ApiError> {
     let connection = database.lock().map_err(internal)?;
-    Ok(Json(find_thread(&connection, &finder)?))
+    Ok(Json(find_dossier(&connection, &finder)?))
 }
 
 async fn list(
@@ -121,7 +117,7 @@ async fn list(
     find_manifest(&connection, &flag)?;
     page.read(
         &connection,
-        "SELECT sequence, finder, accepted_at FROM finder_threads
+        "SELECT sequence, finder, accepted_at FROM dossiers
          WHERE flag = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
         |after, limit| (flag.as_str(), after, limit),
         |row| {
@@ -137,25 +133,22 @@ async fn list(
 async fn append(
     State(database): State<Database>,
     Path(finder): Path<String>,
-    Json(entry): Json<ThreadMessage>,
-) -> Result<(StatusCode, Json<ThreadMessage>), ApiError> {
+    Json(entry): Json<DossierMessage>,
+) -> Result<(StatusCode, Json<DossierMessage>), ApiError> {
     let opening = {
         let connection = database.lock().map_err(internal)?;
-        find_thread(&connection, &finder)?.opening
+        find_dossier(&connection, &finder)?.opening
     };
     verify_entry(&opening.participants, &entry).map_err(bad_request)?;
     if entry.nonce == opening.first.nonce {
-        return Err((StatusCode::CONFLICT, "nonce used by thread opening".into()));
+        return Err((StatusCode::CONFLICT, "nonce used by dossier opening".into()));
     }
-    let mut connection = database.lock().map_err(internal)?;
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal)?;
-    let inserted = tx
+    let connection = database.lock().map_err(internal)?;
+    let inserted = connection
         .execute(
-            "INSERT INTO thread_entries (finder, nonce, document, sequence)
+            "INSERT INTO dossier_messages (finder, nonce, document, sequence)
              VALUES (?1, ?2, ?3,
-                 (SELECT coalesce(max(sequence), 0) + 1 FROM thread_entries WHERE finder = ?1))
+                 (SELECT coalesce(max(sequence), 0) + 1 FROM dossier_messages WHERE finder = ?1))
              ON CONFLICT (finder, nonce) DO NOTHING",
             params![
                 finder,
@@ -167,9 +160,9 @@ async fn append(
     let status = if inserted == 1 {
         StatusCode::CREATED
     } else {
-        let stored: ThreadMessage = tx
+        let stored: DossierMessage = connection
             .query_row(
-                "SELECT document FROM thread_entries WHERE finder = ?1 AND nonce = ?2",
+                "SELECT document FROM dossier_messages WHERE finder = ?1 AND nonce = ?2",
                 params![finder, entry.nonce],
                 |row| read_json(row, 0),
             )
@@ -177,12 +170,11 @@ async fn append(
         if stored != entry {
             return Err((
                 StatusCode::CONFLICT,
-                "thread message nonce already used".into(),
+                "dossier message nonce already used".into(),
             ));
         }
         StatusCode::OK
     };
-    tx.commit().map_err(internal)?;
     Ok((status, Json(entry)))
 }
 
@@ -190,21 +182,21 @@ async fn messages(
     State(database): State<Database>,
     Path(finder): Path<String>,
     Query(page): Query<PageQuery>,
-) -> Result<Json<Page<ThreadMessage>>, ApiError> {
+) -> Result<Json<Page<DossierMessage>>, ApiError> {
     let connection = database.lock().map_err(internal)?;
     let exists: bool = connection
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM finder_threads WHERE finder = ?1)",
+            "SELECT EXISTS (SELECT 1 FROM dossiers WHERE finder = ?1)",
             [&finder],
             |row| row.get(0),
         )
         .map_err(internal)?;
     if !exists {
-        return Err((StatusCode::NOT_FOUND, "unknown finder thread".into()));
+        return Err((StatusCode::NOT_FOUND, "unknown dossier".into()));
     }
     page.read(
         &connection,
-        "SELECT sequence, document FROM thread_entries
+        "SELECT sequence, document FROM dossier_messages
          WHERE finder = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
         |after, limit| (finder.as_str(), after, limit),
         |row| read_json(row, 1),
@@ -213,10 +205,73 @@ async fn messages(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Barrier, Mutex},
+        time::Duration,
+    };
 
     use super::*;
-    use crate::{generate, threads};
+    use crate::{dossiers, generate};
+
+    #[test]
+    fn separate_connections_allocate_unique_receipts_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("records.sqlite3");
+        drop(crate::api::app(Connection::open(&path).unwrap()).unwrap());
+        let (flag, manifest, _) = generate(Default::default());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO hunts (public_key, document) VALUES (?1, ?2)",
+                params![
+                    manifest.public_key,
+                    serde_json::to_string(&manifest).unwrap()
+                ],
+            )
+            .unwrap();
+        let openings: Vec<_> = (0..8)
+            .map(|_| dossiers::open(&flag, &manifest, &dossiers::fresh_secret(), "report").unwrap())
+            .collect();
+        let barrier = Barrier::new(openings.len());
+        let mut sequences = std::thread::scope(|scope| {
+            let writers: Vec<_> = openings
+                .into_iter()
+                .map(|opening| {
+                    let (path, barrier) = (&path, &barrier);
+                    scope.spawn(move || {
+                        let connection = Connection::open(path).unwrap();
+                        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+                        connection
+                            .pragma_update(None, "foreign_keys", "ON")
+                            .unwrap();
+                        let database = Arc::new(Mutex::new(connection));
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        barrier.wait();
+                        runtime.block_on(async {
+                            let (status, Json(accepted)) =
+                                open(State(database.clone()), Json(opening.clone()))
+                                    .await
+                                    .unwrap();
+                            assert_eq!(status, StatusCode::CREATED);
+                            let (status, Json(retried)) =
+                                open(State(database), Json(opening)).await.unwrap();
+                            assert_eq!(status, StatusCode::OK);
+                            assert_eq!(retried, accepted);
+                            accepted.receipt.sequence
+                        })
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=8).collect::<Vec<_>>());
+    }
 
     #[tokio::test]
     async fn receipts_and_message_order_survive_restart_and_retries() {
@@ -239,7 +294,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .execute(
-                    "INSERT INTO canaries (public_key, document) VALUES (?1, ?2)",
+                    "INSERT INTO hunts (public_key, document) VALUES (?1, ?2)",
                     params![
                         manifest.public_key,
                         serde_json::to_string(manifest).unwrap()
@@ -247,17 +302,17 @@ mod tests {
                 )
                 .unwrap();
         }
-        let secret = threads::fresh_secret();
-        let first = threads::open(&flag, &manifest, &secret, "first report").unwrap();
-        let other = threads::open(
+        let secret = dossiers::fresh_secret();
+        let first = dossiers::open(&flag, &manifest, &secret, "first report").unwrap();
+        let other = dossiers::open(
             &other_flag,
             &other_manifest,
-            &threads::fresh_secret(),
+            &dossiers::fresh_secret(),
             "other flag",
         )
         .unwrap();
         let second =
-            threads::open(&flag, &manifest, &threads::fresh_secret(), "second report").unwrap();
+            dossiers::open(&flag, &manifest, &dossiers::fresh_secret(), "second report").unwrap();
         let mut accepted = Vec::new();
         for opening in [&first, &other, &second] {
             let (status, Json(response)) = open(State(database.clone()), Json(opening.clone()))
@@ -271,7 +326,7 @@ mod tests {
         assert_eq!(accepted[1].receipt.sequence, 1);
         assert_eq!(accepted[2].receipt.sequence, 2);
 
-        let reply = threads::encrypt(&first.participants, &secret, "first reply").unwrap();
+        let reply = dossiers::encrypt(&first.participants, &secret, "first reply").unwrap();
         let finder = first.participants.finder.clone();
         for expected in [StatusCode::CREATED, StatusCode::OK] {
             let (status, _) = append(
@@ -295,11 +350,11 @@ mod tests {
         for (flag, manifest, sequence) in [(&flag, &manifest, 3), (&other_flag, &other_manifest, 2)]
         {
             let opening =
-                threads::open(flag, manifest, &threads::fresh_secret(), "after restart").unwrap();
+                dossiers::open(flag, manifest, &dossiers::fresh_secret(), "after restart").unwrap();
             let (_, Json(response)) = open(State(database.clone()), Json(opening)).await.unwrap();
             assert_eq!(response.receipt.sequence, sequence);
         }
-        let last = threads::encrypt(&first.participants, &secret, "after restart").unwrap();
+        let last = dossiers::encrypt(&first.participants, &secret, "after restart").unwrap();
         let (status, Json(stored)) = append(
             State(database.clone()),
             Path(finder.clone()),

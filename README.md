@@ -25,18 +25,18 @@ the dossiers for this flag. Keep those keys backed up outside the target.
 ## What the API does
 
 The API is a small HTTP service backed by SQLite. The `register` command sends
-the manifest to the API and prints the hunt URL, `/dossiers/{flag}`. A finder
+the manifest to `POST /hunts` and prints the hunt URL, `/hunts/{flag}`. A finder
 sends a signed proof and encrypted note to `POST /report`. The API verifies
 the proof and returns the submission with a receipt giving its dossier ID,
 order of arrival and time.
 
-`GET /threads/{id}` returns the opening and its receipt. Replies are at
-`/threads/{id}/messages`. Lists use `{items, next_after}`; pass `after` to
-continue from the returned cursor.
+`GET /hunts/{flag}/dossiers` lists its receipts. `GET /dossiers/{id}` returns
+the opening and its receipt. Replies are at `/dossiers/{id}/messages`. Lists use
+`{items, next_after}`; pass `after` to continue from the returned cursor.
 The API stores the notes as ciphertext. Anyone with the hunt URL can see the
 dossier IDs, when reports arrived, which side sent each note and its size.
 
-## Create a canary
+## Create a hunt
 
 With Rust installed, run these commands from the repository to install the CLI
 and start the local API.
@@ -46,17 +46,17 @@ cargo install --locked --path .
 kompromat-api
 ```
 
-In another terminal, use a private directory to write the flag to `canary.json`,
+In another terminal, use a private directory to write the flag to `flag.json`,
 save the public manifest as `manifest.json`, and register it.
 
 ```sh
-kompromat generate --out canary.json --manifest-out manifest.json
+kompromat generate --out flag.json --manifest-out manifest.json
 kompromat register manifest.json
 ```
 
-Keep `defender.json` here and place a copy of `canary.json` in a backup. Share
+Keep `defender.json` here and place a copy of `flag.json` in a backup. Share
 the hunt URL in your own brief. Whoever finds the file can run
-`kompromat report canary.json --hunt "$HUNT_URL" --message 'Found in the backup'`.
+`kompromat report flag.json --hunt "$HUNT_URL" --message 'Found in the backup'`.
 For a longer note, use `--message-stdin < writeup.txt`. The flag stays local.
 
 The finder reads replies with `kompromat unlock <dossier-key-file>`. You can

@@ -36,9 +36,9 @@ enum Command {
         /// Path for the flag to plant.
         #[arg(long)]
         out: PathBuf,
-        /// Save the defender key at this path (default: defender.json in the current directory).
-        #[arg(long)]
-        defender_out: Option<PathBuf>,
+        /// Save the defender key at this path.
+        #[arg(long, default_value = "defender.json")]
+        defender_out: PathBuf,
         /// Write the public manifest to a new file (default: stdout).
         #[arg(long)]
         manifest_out: Option<PathBuf>,
@@ -110,8 +110,8 @@ enum Command {
     Unlock {
         key: PathBuf,
         /// Continue an inbox or conversation after this cursor.
-        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
-        after: Option<i64>,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+        after: i64,
         /// Dossier to read with a defender key. Omit to list capture receipts.
         #[arg(long, value_name = "ID")]
         dossier: Option<String>,
@@ -137,16 +137,13 @@ fn main() -> Result<()> {
             let metadata: Map<String, Value> =
                 serde_json::from_str(&metadata).context("metadata must be a JSON object")?;
             let api = registry_base(&api)?;
-            let defender_out = defender_out
-                .as_deref()
-                .unwrap_or(Path::new("defender.json"));
-            private::generate(&out, defender_out, manifest_out.as_deref(), metadata, &api)?;
+            private::generate(&out, &defender_out, manifest_out.as_deref(), metadata, &api)?;
         }
         Command::Register { manifest, api } => {
             let manifest: Manifest = read_json(&manifest)?;
             validate_public_key(&manifest.public_key)?;
             let hunt = hunt_url(&api, &manifest.public_key)?;
-            let registered: Manifest = post(&api, "dossiers", &manifest)?;
+            let registered: Manifest = post(&api, "hunts", &manifest)?;
             ensure!(
                 registered == manifest,
                 "API acknowledged a different manifest"
@@ -217,7 +214,7 @@ fn main() -> Result<()> {
 }
 
 fn hunt_url(api: &str, flag: &str) -> Result<Url> {
-    registry_endpoint(api, &format!("dossiers/{flag}"))
+    registry_endpoint(api, &format!("hunts/{flag}"))
 }
 
 fn registry_base(api: &str) -> Result<String> {
@@ -260,7 +257,7 @@ fn hunt_base(link: &Url, flag_id: &str) -> Result<String> {
     check_registry_url(link)?;
     validate_public_key(flag_id)?;
     ensure!(
-        link.path().ends_with(&format!("/dossiers/{flag_id}")),
+        link.path().ends_with(&format!("/hunts/{flag_id}")),
         "hunt URL does not select this flag"
     );
     Ok(link.join("../")?.as_str().trim_end_matches('/').to_owned())
@@ -348,12 +345,11 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 }
 
 fn post<T: DeserializeOwned>(api: &str, resource: &str, body: &impl Serialize) -> Result<T> {
-    post_url(registry_endpoint(api, resource)?, body)
-}
-
-fn post_url<T: DeserializeOwned>(url: Url, body: &impl Serialize) -> Result<T> {
     // A submission is capped at 64 KiB; its acknowledgment can also include a receipt.
-    let response = client()?.post(url).json(body).send()?;
+    let response = client()?
+        .post(registry_endpoint(api, resource)?)
+        .json(body)
+        .send()?;
     response_json_bound(response, 128 * 1024)
 }
 

@@ -25,7 +25,7 @@ pub struct Participants {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ThreadMessage {
+pub struct DossierMessage {
     pub sender: String,
     pub nonce: String,
     pub ciphertext: String,
@@ -36,7 +36,7 @@ pub struct ThreadMessage {
 #[serde(deny_unknown_fields)]
 pub struct Opening {
     pub participants: Participants,
-    pub first: ThreadMessage,
+    pub first: DossierMessage,
     pub proof: Proof,
 }
 
@@ -108,7 +108,7 @@ impl Participants {
     }
 }
 
-pub fn encrypt(p: &Participants, secret: &str, text: &str) -> Result<ThreadMessage> {
+pub fn encrypt(p: &Participants, secret: &str, text: &str) -> Result<DossierMessage> {
     ensure!(text.len() <= MAX_MESSAGE_BYTES, "message exceeds 16 KiB");
     let own = keypair(secret)?;
     let sender = hex::encode(own.public.to_bytes());
@@ -126,7 +126,7 @@ pub fn encrypt(p: &Participants, secret: &str, text: &str) -> Result<ThreadMessa
         .map_err(|_| anyhow!("finder dossier encryption failed"))?;
     signed.extend_from_slice(&nonce);
     signed.extend_from_slice(&ciphertext);
-    Ok(ThreadMessage {
+    Ok(DossierMessage {
         sender,
         nonce: hex::encode(nonce),
         ciphertext: hex::encode(ciphertext),
@@ -134,7 +134,7 @@ pub fn encrypt(p: &Participants, secret: &str, text: &str) -> Result<ThreadMessa
     })
 }
 
-fn signed_bytes(p: &Participants, entry: &ThreadMessage) -> Result<Vec<u8>> {
+fn signed_bytes(p: &Participants, entry: &DossierMessage) -> Result<Vec<u8>> {
     ensure!(
         (32..=(MAX_MESSAGE_BYTES + 16) * 2).contains(&entry.ciphertext.len())
             && entry
@@ -149,7 +149,7 @@ fn signed_bytes(p: &Participants, entry: &ThreadMessage) -> Result<Vec<u8>> {
     Ok(signed)
 }
 
-pub fn verify_entry(p: &Participants, entry: &ThreadMessage) -> Result<()> {
+pub fn verify_entry(p: &Participants, entry: &DossierMessage) -> Result<()> {
     let signed = signed_bytes(p, entry)?;
     let signature =
         Signature::from_bytes(&decode::<64>(&entry.signature)?).map_err(|e| anyhow!("{e}"))?;
@@ -158,7 +158,7 @@ pub fn verify_entry(p: &Participants, entry: &ThreadMessage) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-pub fn decrypt(p: &Participants, secret: &str, entry: &ThreadMessage) -> Result<String> {
+pub fn decrypt(p: &Participants, secret: &str, entry: &DossierMessage) -> Result<String> {
     verify_entry(p, entry)?;
     let nonce = decode::<24>(&entry.nonce)?;
     let plaintext = p
@@ -174,7 +174,7 @@ pub fn decrypt(p: &Participants, secret: &str, entry: &ThreadMessage) -> Result<
     Ok(String::from_utf8(plaintext)?)
 }
 
-fn opening_claim(p: &Participants, first: &ThreadMessage) -> Result<String> {
+fn opening_claim(p: &Participants, first: &DossierMessage) -> Result<String> {
     // The signature at the end is fixed width, so the ciphertext boundary
     // remains unambiguous. The flag proof itself uses the existing Proof format.
     let digest = Sha256::new()

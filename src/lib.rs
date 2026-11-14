@@ -1,8 +1,8 @@
 //! Local key generation and Schnorr proofs of possession.
 
 pub mod api;
+pub mod dossiers;
 pub mod publication;
-pub mod threads;
 
 use anyhow::{Result, anyhow, ensure};
 use schnorrkel::{ExpansionMode, Keypair, MiniSecretKey, PublicKey, Signature};
@@ -154,7 +154,7 @@ mod tests {
         let mut metadata = Map::new();
         metadata.insert("instructions".into(), Value::String("hunt brief".into()));
         let (flag, manifest, defender_secret) = generate(metadata);
-        let defender = threads::participant_public(&defender_secret).unwrap();
+        let defender = dossiers::participant_public(&defender_secret).unwrap();
         assert_eq!(flag.defender_public_key, defender);
         assert_eq!(manifest.defender_public_key, defender);
         assert_eq!(manifest.metadata["instructions"], "hunt brief");
@@ -228,7 +228,7 @@ mod tests {
         let keypair = secret.expand_to_keypair(ExpansionMode::Ed25519);
         let public = Manifest {
             public_key: hex::encode(keypair.public.to_bytes()),
-            defender_public_key: threads::participant_public(&threads::fresh_secret()).unwrap(),
+            defender_public_key: dossiers::participant_public(&dossiers::fresh_secret()).unwrap(),
             metadata: Map::new(),
         };
         let proof = Proof {

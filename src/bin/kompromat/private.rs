@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail, ensure};
 use kompromat::publication::{self, Listing, PublicationState};
 use kompromat::{
     Key, Manifest,
-    threads::{self, AcceptedOpening, CaptureReceipt, Opening, Page, Participants, ThreadMessage},
+    dossiers::{
+        self, AcceptedOpening, CaptureReceipt, DossierMessage, Opening, Page, Participants,
+    },
     validate_public_key,
 };
 use reqwest::Url;
@@ -22,7 +24,7 @@ use super::{
 // A full page holds up to 50 messages of 16 KiB each, encoded as hex.
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
-// Local files. Only the public Opening or a signed ThreadMessage goes on the wire.
+// Local files. Only the public Opening or a signed DossierMessage goes on the wire.
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Credential {
@@ -55,7 +57,7 @@ impl Credential {
     }
 
     fn manifest(&self) -> Result<Manifest> {
-        let my_public = threads::participant_public(self.secret())?;
+        let my_public = dossiers::participant_public(self.secret())?;
         let (flag, defender) = match self {
             Self::Defender { flag, .. } => (flag.as_str(), my_public),
             Self::Finder { opening, .. } => {
@@ -91,7 +93,7 @@ impl Credential {
             Self::Defender { .. } => {
                 let id = dossier.context("specify a dossier with --dossier")?;
                 validate_public_key(id)?;
-                let accepted: AcceptedOpening = get(api, &format!("threads/{id}"))?;
+                let accepted: AcceptedOpening = get(api, &format!("dossiers/{id}"))?;
                 ensure!(
                     accepted.opening.participants.finder == id && accepted.receipt.dossier_id == id,
                     "API returned a different dossier"
@@ -99,7 +101,7 @@ impl Credential {
                 accepted.opening
             }
         };
-        threads::verify_opening(&opening, &manifest)?;
+        dossiers::verify_opening(&opening, &manifest)?;
         Ok(opening)
     }
 }
@@ -158,7 +160,7 @@ pub(super) fn publication(key: &Path, listing: Option<Listing>) -> Result<()> {
     };
     validate_public_key(flag)?;
     let api = credential.api()?;
-    let path = format!("dossiers/{flag}/publication");
+    let path = format!("hunts/{flag}/publication");
     let current: PublicationState = get(&api, &path)?;
     let change = publication::sign(secret, flag, &current, listing)?;
     let accepted: PublicationState = post(&api, &path, &change)?;
@@ -176,8 +178,8 @@ pub(super) fn report(
     dossier_key_out: Option<PathBuf>,
     hunt: &str,
 ) -> Result<()> {
-    let secret = threads::fresh_secret();
-    let opening = threads::open(flag, manifest, &secret, message)?;
+    let secret = dossiers::fresh_secret();
+    let opening = dossiers::open(flag, manifest, &secret, message)?;
     let path = dossier_key_out
         .unwrap_or_else(|| format!("dossier-key-{}.json", opening.participants.finder).into());
     let credential = Credential::Finder {
@@ -193,7 +195,7 @@ pub(super) fn resend(credential: &Credential, path: &Path) -> Result<()> {
     let Credential::Finder { opening, .. } = credential else {
         bail!("report requires a flag or a saved dossier key");
     };
-    threads::verify_opening(opening, &credential.manifest()?)?;
+    dossiers::verify_opening(opening, &credential.manifest()?)?;
     let acknowledgement = post::<AcceptedOpening>(&credential.api()?, "report", opening)
         .and_then(|ack| {
             ensure!(
@@ -216,19 +218,14 @@ pub(super) fn resend(credential: &Credential, path: &Path) -> Result<()> {
     }))
 }
 
-pub(super) fn unlock(
-    credential: &Credential,
-    dossier: Option<&str>,
-    after: Option<i64>,
-) -> Result<()> {
+pub(super) fn unlock(credential: &Credential, dossier: Option<&str>, after: i64) -> Result<()> {
     let api = credential.api()?;
-    let after = after.unwrap_or(0);
     ensure!(after >= 0, "invalid page cursor");
     if dossier.is_none() && matches!(credential, Credential::Defender { .. }) {
         let manifest = credential.manifest()?;
         let page: Page<CaptureReceipt> = get_page(
             &api,
-            &format!("dossiers/{}/threads", manifest.public_key),
+            &format!("hunts/{}/dossiers", manifest.public_key),
             after,
         )?;
         let mut previous = after;
@@ -245,7 +242,7 @@ pub(super) fn unlock(
     let participants = &opening.participants;
     let page: Page<Value> = get_page(
         &api,
-        &format!("threads/{}/messages", participants.finder),
+        &format!("dossiers/{}/messages", participants.finder),
         after,
     )?;
     let mut messages = Vec::new();
@@ -268,15 +265,15 @@ pub(super) fn unlock(
     }))
 }
 
-fn read_message(p: &Participants, secret: &str, entry: &ThreadMessage) -> Value {
+fn read_message(p: &Participants, secret: &str, entry: &DossierMessage) -> Value {
     let sender = if entry.sender == p.finder {
         "finder"
     } else {
         "defender"
     };
-    match threads::decrypt(p, secret, entry) {
+    match dossiers::decrypt(p, secret, entry) {
         Ok(text) => json!({"sender": sender, "text": text}),
-        Err(_) if threads::verify_entry(p, entry).is_err() => json!({"error": "invalid message"}),
+        Err(_) if dossiers::verify_entry(p, entry).is_err() => json!({"error": "invalid message"}),
         Err(_) => json!({"sender": sender, "error": "unreadable message"}),
     }
 }
@@ -285,10 +282,10 @@ pub(super) fn attach(credential: &Credential, dossier: Option<&str>, message: &s
     let api = credential.api()?;
     let opening = credential.opening(dossier, &api)?;
     let participants = &opening.participants;
-    let entry = threads::encrypt(participants, credential.secret(), message)?;
-    let acknowledgement: ThreadMessage = post(
+    let entry = dossiers::encrypt(participants, credential.secret(), message)?;
+    let acknowledgement: DossierMessage = post(
         &api,
-        &format!("threads/{}/messages", participants.finder),
+        &format!("dossiers/{}/messages", participants.finder),
         &entry,
     )?;
     ensure!(
@@ -321,12 +318,12 @@ mod tests {
     #[test]
     fn transcript_attributes_only_verified_entries_and_preserves_readable_neighbors() {
         let (flag, manifest, defender) = kompromat::generate(Map::new());
-        let finder = threads::fresh_secret();
-        let opening = threads::open(&flag, &manifest, &finder, "first").unwrap();
+        let finder = dossiers::fresh_secret();
+        let opening = dossiers::open(&flag, &manifest, &finder, "first").unwrap();
         let p = &opening.participants;
 
         // A finder can sign arbitrary bytes, including an invalid AEAD tag.
-        let mut corrupt = threads::encrypt(p, &finder, "second").unwrap();
+        let mut corrupt = dossiers::encrypt(p, &finder, "second").unwrap();
         corrupt.ciphertext = "00".repeat(16);
         let mut wire = Vec::new();
         for part in [
@@ -349,7 +346,7 @@ mod tests {
         );
         let mut forged = corrupt.clone();
         forged.sender = p.defender.clone();
-        let reply = threads::encrypt(p, &defender, "last").unwrap();
+        let reply = dossiers::encrypt(p, &defender, "last").unwrap();
 
         let transcript = [opening.first, corrupt, forged, reply]
             .iter()

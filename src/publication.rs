@@ -5,7 +5,7 @@ use reqwest::Url;
 use schnorrkel::Signature;
 use serde::{Deserialize, Serialize};
 
-use crate::{decode, public_key, threads::keypair};
+use crate::{decode, dossiers::keypair, public_key};
 
 const CONTEXT: &[u8] = b"kompromat:hunt-publication:v1";
 

@@ -17,7 +17,7 @@ struct Api {
 impl Api {
     fn hunt(&self, manifest: &Value) -> String {
         format!(
-            "{}/dossiers/{}",
+            "{}/hunts/{}",
             self.url,
             manifest["public_key"].as_str().unwrap()
         )
@@ -194,7 +194,7 @@ fn finders_of_the_same_flag_have_separate_dossiers_by_default() {
             .success()
     );
 
-    let opening = reqwest::blocking::get(format!("{}/threads/{alice}", api.url))
+    let opening = reqwest::blocking::get(format!("{}/dossiers/{alice}", api.url))
         .unwrap()
         .error_for_status()
         .unwrap()
@@ -271,10 +271,7 @@ fn unacknowledged_reports_recover_the_original_receipt_after_restart() {
         let manifest = success(cli(path, &["generate", "--out", "flag", "--api", &api]));
         fs::write(path.join("manifest"), manifest.to_string()).unwrap();
         success(cli(path, &["register", "manifest", "--api", &api]));
-        let hunt = format!(
-            "{api}/dossiers/{}",
-            manifest["public_key"].as_str().unwrap()
-        );
+        let hunt = format!("{api}/hunts/{}", manifest["public_key"].as_str().unwrap());
         let accepted = std::thread::scope(|scope| {
             let reporter = scope.spawn(|| {
                 cli(
@@ -319,7 +316,7 @@ fn unacknowledged_reports_recover_the_original_receipt_after_restart() {
         assert_eq!(retried["receipt"], accepted["receipt"]);
         assert_eq!(retried["dossier_key_file"], key);
         assert_eq!(
-            get_json(&format!("{hunt}/threads")),
+            get_json(&format!("{hunt}/dossiers")),
             json!({"items": [accepted["receipt"]], "next_after": null})
         );
         assert_eq!(

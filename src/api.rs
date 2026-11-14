@@ -1,7 +1,7 @@
 //! An HTTP registry for public manifests, proofs of key possession, and encrypted messages.
 
+mod dossiers;
 mod publication;
-mod threads;
 
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +14,7 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use serde::{Deserialize, de::DeserializeOwned};
 
-use crate::threads::Page;
+use crate::dossiers::Page;
 use crate::{Manifest, validate_public_key};
 
 type Database = Arc<Mutex<Connection>>;
@@ -44,13 +44,13 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
     );
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS canaries (
+         CREATE TABLE IF NOT EXISTS hunts (
              public_key TEXT PRIMARY KEY,
              document TEXT NOT NULL
          );",
     )?;
 
-    threads::initialize(&connection)?;
+    dossiers::initialize(&connection)?;
     publication::initialize(&connection)?;
     Ok(Router::new()
         .route(
@@ -65,9 +65,9 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
                 }
             }),
         )
-        .route("/dossiers", post(register))
-        .route("/dossiers/{public_key}", get(get_manifest))
-        .merge(threads::routes())
+        .route("/hunts", post(register))
+        .route("/hunts/{flag}", get(get_manifest))
+        .merge(dossiers::routes())
         .merge(publication::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Mutex::new(connection))))
@@ -85,7 +85,7 @@ fn bad_request(error: impl std::fmt::Display) -> ApiError {
 fn find_manifest(connection: &Connection, public_key: &str) -> Result<Manifest, ApiError> {
     let document: Option<String> = connection
         .query_row(
-            "SELECT document FROM canaries WHERE public_key = ?1",
+            "SELECT document FROM hunts WHERE public_key = ?1",
             [public_key],
             |row| row.get(0),
         )
@@ -115,7 +115,7 @@ async fn register(
     let connection = database.lock().map_err(internal)?;
     let inserted = connection
         .execute(
-            "INSERT INTO canaries (public_key, document) VALUES (?1, ?2)
+            "INSERT INTO hunts (public_key, document) VALUES (?1, ?2)
              ON CONFLICT (public_key) DO NOTHING",
             params![
                 manifest.public_key,
@@ -262,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn finder_openings_and_messages_are_atomic_and_scoped() {
-        use crate::threads::{encrypt, fresh_secret, open};
+        use crate::dossiers::{encrypt, fresh_secret, open};
 
         async fn read(router: &Router, uri: &str) -> Value {
             let (status, document) = request(router, Method::GET, uri, None).await;
@@ -277,14 +277,14 @@ mod tests {
             let mut changed = manifest.clone();
             changed.defender_public_key = invalid;
             assert_eq!(
-                request(&router, Method::POST, "/dossiers", Some(json!(changed)))
+                request(&router, Method::POST, "/hunts", Some(json!(changed)))
                     .await
                     .0,
                 StatusCode::BAD_REQUEST
             );
         }
         assert_eq!(
-            request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
+            request(&router, Method::POST, "/hunts", Some(json!(manifest)))
                 .await
                 .0,
             StatusCode::CREATED
@@ -309,7 +309,7 @@ mod tests {
             let (actual, body) =
                 request(&router, Method::POST, "/report", Some(json!(report))).await;
             assert_eq!(actual, status);
-            let response: crate::threads::AcceptedOpening = serde_json::from_str(&body).unwrap();
+            let response: crate::dossiers::AcceptedOpening = serde_json::from_str(&body).unwrap();
             assert_eq!(&response.opening, report);
             if status == StatusCode::CREATED {
                 assert_eq!(response.receipt.sequence, accepted.len() as i64 + 1);
@@ -327,22 +327,22 @@ mod tests {
                 .0,
             StatusCode::CONFLICT
         );
-        let route = format!("/dossiers/{}", manifest.public_key);
+        let route = format!("/hunts/{}", manifest.public_key);
         let db = Connection::open(file.path()).unwrap();
-        let stored_threads: i64 = db
-            .query_row("SELECT count(*) FROM finder_threads", [], |row| row.get(0))
+        let stored_dossiers: i64 = db
+            .query_row("SELECT count(*) FROM dossiers", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(stored_threads, 2);
+        assert_eq!(stored_dossiers, 2);
         drop(db);
 
-        let entries = format!("/threads/{}/messages", alice_report.participants.finder);
+        let entries = format!("/dossiers/{}/messages", alice_report.participants.finder);
         let reply = encrypt(
             &alice_report.participants,
             &defender,
             "DEF's reply to Alice",
         )
         .unwrap();
-        let wrong = format!("/threads/{}/messages", bob_report.participants.finder);
+        let wrong = format!("/dossiers/{}/messages", bob_report.participants.finder);
         assert_eq!(
             request(&router, Method::POST, &wrong, Some(json!(reply)))
                 .await
@@ -379,29 +379,38 @@ mod tests {
         drop(router);
         let reopened = app(Connection::open(file.path()).unwrap()).unwrap();
         assert_eq!(
-            read(&reopened, &format!("{route}/threads?limit=1")).await,
+            read(&reopened, &format!("{route}/dossiers?limit=1")).await,
             json!({"items": [accepted[0]], "next_after": 1})
         );
         assert_eq!(
-            read(&reopened, &format!("{route}/threads?limit=1&after=1")).await,
+            read(&reopened, &format!("{route}/dossiers?limit=1&after=1")).await,
             json!({"items": [accepted[1]], "next_after": null})
         );
         assert_eq!(
             request(
                 &reopened,
                 Method::GET,
-                &format!("{route}/threads?limit=51"),
+                &format!("{route}/dossiers?limit=51"),
                 None
             )
             .await
             .0,
             StatusCode::BAD_REQUEST
         );
-        let alice_thread = format!("/threads/{}", alice_report.participants.finder);
+        let alice_dossier = format!("/dossiers/{}", alice_report.participants.finder);
         assert_eq!(
-            read(&reopened, &alice_thread).await,
+            read(&reopened, &alice_dossier).await,
             json!({"opening": alice_report, "receipt": accepted[0]})
         );
+        for obsolete in [
+            format!("/threads/{}", alice_report.participants.finder),
+            format!("/dossiers/{}/threads", manifest.public_key),
+        ] {
+            assert_eq!(
+                request(&reopened, Method::GET, &obsolete, None).await.0,
+                StatusCode::NOT_FOUND
+            );
+        }
         assert_eq!(
             read(&reopened, &format!("{entries}?limit=1")).await,
             json!({"items": [reply], "next_after": 1})
@@ -429,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn registrations_and_reports_reject_invalid_or_secret_data() {
-        use crate::threads::{encrypt, fresh_secret, open};
+        use crate::dossiers::{encrypt, fresh_secret, open};
 
         let file = tempfile::NamedTempFile::new().unwrap();
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
@@ -448,7 +457,7 @@ mod tests {
             .unwrap()
             .remove("defender_public_key");
         assert_eq!(
-            request(&router, Method::POST, "/dossiers", Some(missing_defender))
+            request(&router, Method::POST, "/hunts", Some(missing_defender))
                 .await
                 .0,
             StatusCode::UNPROCESSABLE_ENTITY
@@ -456,7 +465,7 @@ mod tests {
         let mut secret_manifest = json!(manifest);
         secret_manifest["secret_key"] = json!(flag.secret_key);
         assert_eq!(
-            request(&router, Method::POST, "/dossiers", Some(secret_manifest))
+            request(&router, Method::POST, "/hunts", Some(secret_manifest))
                 .await
                 .0,
             StatusCode::UNPROCESSABLE_ENTITY
@@ -464,7 +473,7 @@ mod tests {
         let mut invalid = manifest.clone();
         invalid.public_key = "00".repeat(32);
         assert_eq!(
-            request(&router, Method::POST, "/dossiers", Some(json!(invalid)))
+            request(&router, Method::POST, "/hunts", Some(json!(invalid)))
                 .await
                 .0,
             StatusCode::BAD_REQUEST
@@ -474,14 +483,14 @@ mod tests {
             .metadata
             .insert("large".into(), json!("x".repeat(64 * 1024)));
         assert_eq!(
-            request(&router, Method::POST, "/dossiers", Some(json!(oversized)))
+            request(&router, Method::POST, "/hunts", Some(json!(oversized)))
                 .await
                 .0,
             StatusCode::PAYLOAD_TOO_LARGE
         );
         for status in [StatusCode::CREATED, StatusCode::OK] {
             assert_eq!(
-                request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
+                request(&router, Method::POST, "/hunts", Some(json!(manifest)))
                     .await
                     .0,
                 status
@@ -492,7 +501,7 @@ mod tests {
             .metadata
             .insert("label".into(), json!("replacement"));
         assert_eq!(
-            request(&router, Method::POST, "/dossiers", Some(json!(changed)))
+            request(&router, Method::POST, "/hunts", Some(json!(changed)))
                 .await
                 .0,
             StatusCode::CONFLICT
@@ -520,7 +529,7 @@ mod tests {
                 .0,
             StatusCode::CREATED
         );
-        let route = format!("/threads/{}/messages", opening.participants.finder);
+        let route = format!("/dossiers/{}/messages", opening.participants.finder);
         let entry = encrypt(&opening.participants, &finder, "follow-up").unwrap();
         let mut changed = entry.clone();
         changed.signature = "00".repeat(64);
@@ -551,7 +560,7 @@ mod tests {
             serde_json::from_str::<Value>(&empty).unwrap(),
             json!({"items": [], "next_after": null})
         );
-        for route in ["/threads/unknown", "/threads/unknown/messages"] {
+        for route in ["/dossiers/unknown", "/dossiers/unknown/messages"] {
             assert_eq!(
                 request(&router, Method::GET, route, None).await.0,
                 StatusCode::NOT_FOUND
@@ -562,7 +571,7 @@ mod tests {
         let (_, saved) = request(
             &reopened,
             Method::GET,
-            &format!("/dossiers/{}", manifest.public_key),
+            &format!("/hunts/{}", manifest.public_key),
             None,
         )
         .await;
@@ -574,15 +583,15 @@ mod tests {
 
     #[tokio::test]
     async fn private_message_history_is_bounded_and_can_be_continued() {
-        use crate::threads::{ThreadMessage, encrypt, fresh_secret, open};
+        use crate::dossiers::{DossierMessage, encrypt, fresh_secret, open};
 
         let router = app(Connection::open_in_memory().unwrap()).unwrap();
         let (flag, manifest, _) = crate::generate(Map::new());
-        request(&router, Method::POST, "/dossiers", Some(json!(manifest))).await;
+        request(&router, Method::POST, "/hunts", Some(json!(manifest))).await;
         let finder = fresh_secret();
         let opening = open(&flag, &manifest, &finder, "opening").unwrap();
         request(&router, Method::POST, "/report", Some(json!(opening))).await;
-        let route = format!("/threads/{}/messages", opening.participants.finder);
+        let route = format!("/dossiers/{}/messages", opening.participants.finder);
         let mut expected = Vec::new();
         for i in 0..51 {
             let entry = encrypt(&opening.participants, &finder, &i.to_string()).unwrap();
@@ -596,13 +605,13 @@ mod tests {
         }
         let (status, response) = request(&router, Method::GET, &route, None).await;
         assert_eq!(status, StatusCode::OK);
-        let page: Page<ThreadMessage> = serde_json::from_str(&response).unwrap();
+        let page: Page<DossierMessage> = serde_json::from_str(&response).unwrap();
         assert_eq!(page.items, expected[..50]);
         assert_eq!(page.next_after, Some(50));
         let (status, response) =
             request(&router, Method::GET, &format!("{route}?after=50"), None).await;
         assert_eq!(status, StatusCode::OK);
-        let page: Page<ThreadMessage> = serde_json::from_str(&response).unwrap();
+        let page: Page<DossierMessage> = serde_json::from_str(&response).unwrap();
         assert_eq!(page.items, expected[50..]);
         assert_eq!(page.next_after, None);
         for query in ["after=-1", "limit=0", "limit=51"] {
@@ -634,27 +643,21 @@ mod tests {
         second.defender_public_key = hunt.defender_public_key.clone();
         for manifest in [&hunt, &second] {
             assert_eq!(
-                request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
+                request(&router, Method::POST, "/hunts", Some(json!(manifest)))
                     .await
                     .0,
                 StatusCode::CREATED
             );
         }
-        request(
-            &other_registry,
-            Method::POST,
-            "/dossiers",
-            Some(json!(hunt)),
-        )
-        .await;
+        request(&other_registry, Method::POST, "/hunts", Some(json!(hunt))).await;
         assert_eq!(
             get(&router, "/hunts").await,
             json!({"items": [], "next_after": null})
         );
         let (_, html) = request(&router, Method::GET, "/", None).await;
         assert!(html.contains("No listings on this page."));
-        let route = format!("/dossiers/{}/publication", hunt.public_key);
-        let second_route = format!("/dossiers/{}/publication", second.public_key);
+        let route = format!("/hunts/{}/publication", hunt.public_key);
+        let second_route = format!("/hunts/{}/publication", second.public_key);
         let initial: PublicationState = serde_json::from_value(get(&router, &route).await).unwrap();
         assert_eq!(initial.revision, 0);
         assert!(initial.listing.is_none());
@@ -695,7 +698,7 @@ mod tests {
         let entry = json!({
             "title": brief.title,
             "brief_url": brief.brief_url,
-            "hunt": format!("dossiers/{}", hunt.public_key)
+            "hunt": format!("hunts/{}", hunt.public_key)
         });
         assert_eq!(
             get(&router, "/hunts").await,
@@ -704,12 +707,12 @@ mod tests {
         let (_, html) = request(&router, Method::GET, "/", None).await;
         assert!(html.contains("Open &lt;hunt&gt;"));
         assert!(html.contains("https://def.example/terms?a=1&amp;b=2"));
-        assert!(html.contains(&format!("href=\"dossiers/{}\"", hunt.public_key)));
+        assert!(html.contains(&format!("href=\"hunts/{}\"", hunt.public_key)));
         assert!(!html.contains(&second.public_key));
         let nested = Router::new().nest("/games/registry", router.clone());
         let (status, nested_html) = request(&nested, Method::GET, "/games/registry", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(nested_html.contains(&format!("href=\"./registry/dossiers/{}\"", hunt.public_key)));
+        assert!(nested_html.contains(&format!("href=\"./registry/hunts/{}\"", hunt.public_key)));
         assert!(nested_html.contains("href=\"./registry/hunts\""));
 
         let second_publish =
@@ -731,7 +734,7 @@ mod tests {
         let second_page = get(&router, &format!("/hunts?after={after}&limit=1")).await;
         assert_eq!(
             second_page["items"][0]["hunt"],
-            format!("dossiers/{}", second.public_key)
+            format!("hunts/{}", second.public_key)
         );
         assert_eq!(second_page["next_after"], Value::Null);
         let (_, html) = request(&router, Method::GET, "/?limit=1", None).await;
@@ -755,7 +758,7 @@ mod tests {
         );
         assert_eq!(get(&reopened, "/hunts").await, second_page);
         for manifest in [&hunt, &second] {
-            let path = format!("/dossiers/{}", manifest.public_key);
+            let path = format!("/hunts/{}", manifest.public_key);
             assert_eq!(get(&reopened, &path).await, json!(manifest));
         }
     }

@@ -12,8 +12,8 @@ use super::{
     ApiError, Database, PageQuery, bad_request, find_manifest, internal, registered_manifest,
 };
 use crate::{
+    dossiers::Page,
     publication::{Listing, PublicationState, SignedPublication},
-    threads::Page,
 };
 
 pub(super) fn initialize(connection: &Connection) -> rusqlite::Result<()> {
@@ -26,7 +26,7 @@ pub(super) fn initialize(connection: &Connection) -> rusqlite::Result<()> {
             VALUES (1, lower(hex(randomblob(32)))) ON CONFLICT (singleton) DO NOTHING;
          CREATE TABLE IF NOT EXISTS hunt_publications (
             id INTEGER PRIMARY KEY,
-            flag TEXT NOT NULL UNIQUE REFERENCES canaries(public_key),
+            flag TEXT NOT NULL UNIQUE REFERENCES hunts(public_key),
             revision INTEGER NOT NULL CHECK (revision > 0),
             title TEXT,
             brief_url TEXT,
@@ -40,7 +40,7 @@ pub(super) fn routes() -> Router<Database> {
     Router::new()
         .route("/", get(index))
         .route("/hunts", get(directory))
-        .route("/dossiers/{flag}/publication", get(status).post(change))
+        .route("/hunts/{flag}/publication", get(status).post(change))
 }
 
 fn current(connection: &Connection, flag: &str) -> Result<PublicationState, ApiError> {
@@ -135,7 +135,7 @@ fn listed(database: &Database, query: &PageQuery) -> Result<Json<Page<PublicHunt
             Ok(PublicHunt {
                 title: row.get(1)?,
                 brief_url: row.get(2)?,
-                hunt: format!("dossiers/{}", row.get::<_, String>(3)?),
+                hunt: format!("hunts/{}", row.get::<_, String>(3)?),
             })
         },
     )
