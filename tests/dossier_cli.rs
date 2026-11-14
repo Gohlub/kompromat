@@ -64,6 +64,112 @@ fn success(output: Output) -> Value {
 }
 
 #[test]
+fn finders_of_the_same_flag_have_separate_dossiers() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let api = Api::start(path);
+    let manifest = success(cli(
+        path,
+        &[
+            "generate",
+            "--out",
+            "flag.json",
+            "--defender-out",
+            "defender.json",
+            "--api",
+            &api.url,
+        ],
+    ));
+    fs::write(path.join("manifest.json"), manifest.to_string()).unwrap();
+    success(cli(path, &["register", "manifest.json", "--api", &api.url]));
+
+    let mut threads = Vec::new();
+    for (file, note) in [
+        ("alice.json", "Alice found an export bug"),
+        ("bob.json", "Bob found a cache bug"),
+    ] {
+        let report = success(cli(
+            path,
+            &[
+                "report",
+                "flag.json",
+                "--message",
+                note,
+                "--finder-out",
+                file,
+            ],
+        ));
+        threads.push(report["thread"].as_str().unwrap().to_owned());
+        let retry = success(cli(path, &["report", file]));
+        assert_eq!(report["thread"], retry["thread"]);
+    }
+    let alice = &threads[0];
+    let bob = &threads[1];
+    assert_ne!(alice, bob);
+    let inbox = success(cli(path, &["unlock", "defender.json"]));
+    assert_eq!(inbox["threads"], serde_json::json!(threads));
+    success(cli(
+        path,
+        &[
+            "attach",
+            "defender.json",
+            "--thread",
+            alice,
+            "--message",
+            "Which request?",
+        ],
+    ));
+    success(cli(
+        path,
+        &["attach", "alice.json", "--message", "GET /export"],
+    ));
+
+    let transcript =
+        serde_json::json!(["Alice found an export bug", "Which request?", "GET /export"]);
+    assert_eq!(
+        success(cli(path, &["unlock", "alice.json"]))["messages"],
+        transcript
+    );
+    assert_eq!(
+        success(cli(path, &["unlock", "defender.json", "--thread", alice]))["messages"],
+        transcript
+    );
+    assert_eq!(
+        success(cli(path, &["unlock", "bob.json"]))["messages"],
+        serde_json::json!(["Bob found a cache bug"])
+    );
+    assert!(
+        !cli(path, &["unlock", "bob.json", "--thread", alice])
+            .status
+            .success()
+    );
+    assert!(
+        !cli(path, &["unlock", "flag.json", "--thread", alice])
+            .status
+            .success()
+    );
+
+    let opening = reqwest::blocking::get(format!("{}/threads/{alice}", api.url))
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(!opening.contains("Alice found an export bug"));
+    let shared: Vec<Value> = reqwest::blocking::get(format!(
+        "{}/dossiers/{}/messages",
+        api.url,
+        manifest["public_key"].as_str().unwrap()
+    ))
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .unwrap();
+    assert!(shared.is_empty());
+}
+
+#[test]
 fn shared_key_unlocks_encrypted_dossier_over_http_and_after_restart() {
     let dir = tempdir().unwrap();
     let public = success(cli(dir.path(), &["generate", "--out", "key.json"]));

@@ -26,6 +26,10 @@ pub struct EncryptedMessage {
 }
 
 pub fn encrypt_message(key: &Key, message: &str) -> Result<EncryptedMessage> {
+    ensure!(
+        key.defender_public_key.is_none(),
+        "this flag uses private finder dossiers"
+    );
     ensure!(message.len() <= MAX_MESSAGE_BYTES, "message exceeds 16 KiB");
     let keypair = key.keypair()?;
     let public = keypair.public.to_bytes();
@@ -191,6 +195,7 @@ mod tests {
                 &proof,
                 &Manifest {
                     public_key: public.public_key,
+                    defender_public_key: None,
                     metadata: Map::new()
                 }
             )

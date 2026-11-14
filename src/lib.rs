@@ -2,6 +2,7 @@
 
 pub mod api;
 mod messages;
+pub mod threads;
 
 pub use messages::{EncryptedMessage, decrypt_message, encrypt_message, verify_message};
 
@@ -58,6 +59,9 @@ impl Submission {
 #[serde(deny_unknown_fields)]
 pub struct Key {
     pub secret_key: String,
+    /// Recipient pinned in a planted flag when private finder dossiers are enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defender_public_key: Option<String>,
     #[serde(default = "default_api")]
     pub api: String,
     #[serde(default = "reporting_instructions")]
@@ -83,6 +87,8 @@ impl Key {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defender_public_key: Option<String>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
 }
@@ -121,15 +127,44 @@ pub fn generate_for_api(mut metadata: Map<String, Value>, api: &str) -> (Key, Ma
     (
         Key {
             secret_key: hex::encode(secret.to_bytes()),
+            defender_public_key: None,
             api: api.into(),
             instructions,
             submission: Some(submission),
         },
         Manifest {
             public_key,
+            defender_public_key: None,
             metadata,
         },
     )
+}
+
+/// Generate a planted flag and a separate, defender-only credential.
+pub fn generate_private_for_api(
+    mut metadata: Map<String, Value>,
+    api: &str,
+) -> Result<(Key, Manifest, String)> {
+    let instructions = metadata.remove("instructions");
+    ensure!(
+        !metadata.contains_key("submission"),
+        "private finder reports use the /threads endpoint"
+    );
+    let (mut flag, mut manifest) = generate_for_api(metadata, api);
+    let defender_secret = threads::fresh_secret();
+    let defender_public = threads::participant_public(&defender_secret)?;
+    flag.defender_public_key = Some(defender_public.clone());
+    manifest.defender_public_key = Some(defender_public);
+
+    flag.instructions = "Found this flag? Run kompromat report PATH_TO_THIS_FILE --message 'your note'. Keep the finder receipt to read replies. Never upload the flag or the receipt.".into();
+    // The legacy curl template describes a different endpoint and message format.
+    flag.submission = None;
+    manifest.metadata.remove("submission");
+    manifest.metadata.insert(
+        "instructions".into(),
+        instructions.unwrap_or_else(|| Value::String(flag.instructions.clone())),
+    );
+    Ok((flag, manifest, defender_secret))
 }
 
 pub fn prove(key: &Key, message: String) -> Result<Proof> {
@@ -271,6 +306,7 @@ mod tests {
             prove(
                 &Key {
                     secret_key: "bad".into(),
+                    defender_public_key: None,
                     api: default_api(),
                     instructions: reporting_instructions(),
                     submission: None,
@@ -287,6 +323,7 @@ mod tests {
         let keypair = secret.expand_to_keypair(ExpansionMode::Ed25519);
         let public = Manifest {
             public_key: hex::encode(keypair.public.to_bytes()),
+            defender_public_key: None,
             metadata: Map::new(),
         };
         let proof = Proof {

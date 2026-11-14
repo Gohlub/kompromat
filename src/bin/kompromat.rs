@@ -1,3 +1,6 @@
+#[path = "kompromat/private.rs"]
+mod private;
+
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -12,7 +15,7 @@ use kompromat::{
     generate_for_api, prove, prove_with_reply, validate_public_key, verify,
 };
 use reqwest::blocking::Client;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 #[derive(Parser)]
@@ -35,6 +38,10 @@ struct ProofArgs {
 
 impl ProofArgs {
     fn create_proof(&self, key: &Key) -> Result<Proof> {
+        ensure!(
+            self.message.is_none() || key.defender_public_key.is_none(),
+            "use report to encrypt this note to the defender"
+        );
         match &self.message {
             Some(note) => prove_with_reply(key, String::new(), note),
             None => prove(key, String::new()),
@@ -49,6 +56,9 @@ enum Command {
         /// Path for the secret key file.
         #[arg(long)]
         out: PathBuf,
+        /// Enable private finder threads; retain this separate secret file off-target.
+        #[arg(long)]
+        defender_out: Option<PathBuf>,
         /// Public metadata as a JSON object; do not include secrets.
         #[arg(long, default_value = "{}")]
         metadata: String,
@@ -64,10 +74,13 @@ enum Command {
     },
     /// Create a proof locally and print it as JSON. The key stays local.
     Prove(ProofArgs),
-    /// Report access in one step: create a proof and POST it with an optional encrypted reply.
+    /// Report a found flag, or retry a saved finder credential.
     Report {
         #[command(flatten)]
         proof: ProofArgs,
+        /// Save this finder's private thread credential at this new path.
+        #[arg(long)]
+        finder_out: Option<PathBuf>,
         /// Override the API address in the key file.
         #[arg(long)]
         api: Option<String>,
@@ -87,42 +100,49 @@ enum Command {
     /// Encrypt and sign a message locally, then append it to the dossier.
     Attach {
         key: PathBuf,
+        /// Finder thread to use with a defender credential.
+        #[arg(long)]
+        thread: Option<String>,
         #[arg(long)]
         message: String,
         /// Override the API address in the key file.
         #[arg(long)]
         api: Option<String>,
     },
-    /// Read the dossier's messages by decrypting them with the key file.
+    /// Read messages with a key or list threads with a defender credential.
     Unlock {
         key: PathBuf,
+        /// Finder thread to read. Omit with a defender credential to list threads.
+        #[arg(long)]
+        thread: Option<String>,
         /// Override the API address in the key file.
         #[arg(long)]
         api: Option<String>,
     },
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LocalKey {
+    Flag(Box<Key>),
+    Private(private::Credential),
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Generate { out, metadata, api } => {
+        Command::Generate {
+            out,
+            defender_out,
+            metadata,
+            api,
+        } => {
             let metadata: Map<String, Value> =
                 serde_json::from_str(&metadata).context("metadata must be a JSON object")?;
-            let (secret, manifest) = generate_for_api(metadata, &api);
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+            if let Some(defender_out) = defender_out {
+                return private::generate(&out, &defender_out, metadata, &api);
             }
-            let mut file = options.open(&out).with_context(|| {
-                format!(
-                    "cannot create {} (existing files are never overwritten)",
-                    out.display()
-                )
-            })?;
-            serde_json::to_writer_pretty(&mut file, &secret)?;
-            writeln!(file)?;
+            let (secret, manifest) = generate_for_api(metadata, &api);
+            write_secret(&out, &secret)?;
             print_json(&manifest)?;
         }
         Command::Register { manifest, api } => {
@@ -134,8 +154,34 @@ fn main() -> Result<()> {
             let secret: Key = read_json(&args.key)?;
             print_json(&args.create_proof(&secret)?)?;
         }
-        Command::Report { proof: args, api } => {
-            let secret: Key = read_json(&args.key)?;
+        Command::Report {
+            proof: args,
+            api,
+            finder_out,
+        } => {
+            let secret = match read_json(&args.key)? {
+                LocalKey::Private(credential) => {
+                    ensure!(
+                        args.message.is_none() && finder_out.is_none(),
+                        "retry the saved report without a new message or --finder-out"
+                    );
+                    return private::resend(&credential, &args.key, api.as_deref());
+                }
+                LocalKey::Flag(key) => key,
+            };
+            if let Some(defender) = &secret.defender_public_key {
+                return private::report(
+                    &secret,
+                    defender,
+                    args.message.as_deref().unwrap_or_default(),
+                    finder_out,
+                    api.as_deref().unwrap_or(&secret.api),
+                );
+            }
+            ensure!(
+                finder_out.is_none(),
+                "--finder-out requires a private dossier"
+            );
             let proof = args.create_proof(&secret)?;
             let url = if let Some(api) = api {
                 format!("{}/proofs", api.trim_end_matches('/'))
@@ -158,6 +204,7 @@ fn main() -> Result<()> {
                 &proof,
                 &Manifest {
                     public_key: proof.public_key.clone(),
+                    defender_public_key: None,
                     metadata: Map::new(),
                 },
             )?;
@@ -167,8 +214,28 @@ fn main() -> Result<()> {
             verify(&read_json(&proof)?, &read_json(&manifest)?)?;
             print_json(&json!({"valid": true}))?;
         }
-        Command::Attach { key, message, api } => {
-            let secret: Key = read_json(&key)?;
+        Command::Attach {
+            key,
+            thread,
+            message,
+            api,
+        } => {
+            let secret = match read_json(&key)? {
+                LocalKey::Private(credential) => {
+                    return private::attach(
+                        &credential,
+                        thread.as_deref(),
+                        &message,
+                        api.as_deref(),
+                    );
+                }
+                LocalKey::Flag(key) => key,
+            };
+            ensure!(
+                secret.defender_public_key.is_none(),
+                "use a finder or defender credential to attach"
+            );
+            ensure!(thread.is_none(), "--thread requires a defender credential");
             let entry = encrypt_message(&secret, &message)?;
             print_json(&post(
                 api.as_deref().unwrap_or(&secret.api),
@@ -176,8 +243,18 @@ fn main() -> Result<()> {
                 &entry,
             )?)?;
         }
-        Command::Unlock { key, api } => {
-            let secret: Key = read_json(&key)?;
+        Command::Unlock { key, thread, api } => {
+            let secret = match read_json(&key)? {
+                LocalKey::Private(credential) => {
+                    return private::unlock(&credential, thread.as_deref(), api.as_deref());
+                }
+                LocalKey::Flag(key) => key,
+            };
+            ensure!(
+                secret.defender_public_key.is_none(),
+                "use a finder or defender credential to unlock"
+            );
+            ensure!(thread.is_none(), "--thread requires a defender credential");
             let public_key = secret.public_key()?;
             let response = client()?
                 .get(format!(
@@ -193,6 +270,30 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             print_json(&json!({"public_key": public_key, "messages": messages}))?;
         }
+    }
+    Ok(())
+}
+
+fn write_secret(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "cannot create {} (existing files are never overwritten)",
+            path.display()
+        )
+    })?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        fs::remove_file(path)
+            .with_context(|| format!("could not remove incomplete {}", path.display()))?;
+        return Err(error.into());
     }
     Ok(())
 }

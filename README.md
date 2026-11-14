@@ -23,6 +23,46 @@ separate encryption key from the same secret with `HKDF-SHA256`, encrypts the te
 with `XChaCha20-Poly1305`, and signs the proof together with the encrypted reply.
 Anyone who holds a copy of the key file can read the reply.
 
+## Private finder dossiers
+
+To give each finder a private conversation with the defender, generate a flag
+with a separate defender file:
+
+```sh
+kompromat generate --out flag.json --defender-out defender.json > manifest.json
+kompromat register manifest.json
+```
+
+Plant only `flag.json`. Keep `defender.json` on the defender’s machine. The
+planted flag pins the defender’s public key, which is also in the manifest.
+Set `--api` on both commands when using a remote facilitator.
+
+The finder opens a dossier with the first report:
+
+```sh
+kompromat report flag.json --message 'I could read the other tenant’s export' --finder-out alice.json
+```
+
+Keep the local receipt `alice.json`; it contains the finder’s private key.
+If the connection fails after creating the receipt, `kompromat report alice.json`
+resubmits the same opening. The defender can list dossier IDs, select one, and
+reply. The finder can read or reply using just their receipt:
+
+```sh
+kompromat unlock defender.json
+kompromat unlock defender.json --thread THREAD_ID
+kompromat attach defender.json --thread THREAD_ID --message 'Which export request did you send?'
+kompromat unlock alice.json
+kompromat attach alice.json --message 'I used the scheduled export.'
+```
+
+The thread ID is a fresh public key generated for that report. The finder and
+defender derive the encryption key locally. Their first note and subsequent
+messages are encrypted and signed. The planted flag signs the opening proof.
+The facilitator can see the flag, thread, senders, and ciphertext. Another
+finder with the same flag can open their own dossier. Existing flags generated
+without `--defender-out` retain the shared dossier described above.
+
 ## What the API does
 
 The API is a small HTTP service backed by SQLite. The `register` command sends

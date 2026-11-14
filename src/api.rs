@@ -1,5 +1,7 @@
 //! An HTTP registry for public manifests, proofs of key possession, and encrypted messages.
 
+mod threads;
+
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -56,6 +58,7 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
          );",
     )?;
 
+    threads::initialize(&connection)?;
     Ok(Router::new()
         .route(
             "/cli",
@@ -81,6 +84,7 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
         .route("/canaries/{public_key}/proofs", get(list_proofs))
         .route("/canaries/{public_key}/record", get(list_messages))
         .route("/records", post(append_message))
+        .merge(threads::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Mutex::new(connection))))
 }
@@ -115,6 +119,12 @@ async fn register(
     Json(manifest): Json<Manifest>,
 ) -> Result<(StatusCode, Json<Manifest>), ApiError> {
     validate_public_key(&manifest.public_key).map_err(bad_request)?;
+    if let Some(defender) = manifest.defender_public_key.as_deref() {
+        validate_public_key(defender).map_err(bad_request)?;
+        if defender == manifest.public_key {
+            return Err(bad_request("defender and flag must use different keys"));
+        }
+    }
     let connection = database.lock().map_err(internal)?;
     let inserted = connection
         .execute(
@@ -155,29 +165,51 @@ async fn submit(
     validate_public_key(&proof.public_key).map_err(bad_request)?;
     let mut connection = database.lock().map_err(internal)?;
     let manifest = find_manifest(&connection, &proof.public_key)?;
+    if manifest.defender_public_key.is_some()
+        && (proof.reply.is_some() || !proof.message.is_empty())
+    {
+        return Err(bad_request("submit private reports to /threads"));
+    }
     verify(&proof, &manifest).map_err(bad_request)?;
     let transaction = connection.transaction().map_err(internal)?;
-    let inserted = transaction
+    let inserted = insert_proof(&transaction, &proof)?;
+    if let Some(reply) = &proof.reply {
+        store_message(&transaction, reply)?;
+    }
+    transaction.commit().map_err(internal)?;
+    let status = if inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(proof)))
+}
+
+fn insert_proof(connection: &Connection, proof: &Proof) -> Result<bool, ApiError> {
+    let inserted = connection
         .execute(
             "INSERT INTO proofs (public_key, signature, document) VALUES (?1, ?2, ?3)
              ON CONFLICT (public_key, signature) DO NOTHING",
             params![
                 proof.public_key,
                 proof.signature,
-                serde_json::to_string(&proof).map_err(internal)?,
+                serde_json::to_string(proof).map_err(internal)?,
             ],
         )
         .map_err(internal)?;
-    if let Some(reply) = &proof.reply {
-        store_message(&transaction, reply)?;
+    if inserted == 0 {
+        let stored: String = connection
+            .query_row(
+                "SELECT document FROM proofs WHERE public_key = ?1 AND signature = ?2",
+                params![proof.public_key, proof.signature],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if &serde_json::from_str::<Proof>(&stored).map_err(internal)? != proof {
+            return Err((StatusCode::CONFLICT, "proof signature already used".into()));
+        }
     }
-    transaction.commit().map_err(internal)?;
-    let status = if inserted == 1 {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(proof)))
+    Ok(inserted == 1)
 }
 
 async fn list_proofs(
@@ -206,6 +238,11 @@ async fn append_message(
     validate_public_key(&entry.public_key).map_err(bad_request)?;
     let connection = database.lock().map_err(internal)?;
     let manifest = find_manifest(&connection, &entry.public_key)?;
+    if manifest.defender_public_key.is_some() {
+        return Err(bad_request(
+            "append private messages to their finder thread",
+        ));
+    }
     verify_message(&entry, &manifest.public_key).map_err(bad_request)?;
     let (status, stored) = store_message(&connection, &entry)?;
     Ok((status, Json(stored)))
@@ -330,6 +367,164 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn finder_openings_and_messages_are_atomic_and_scoped() {
+        use crate::threads::{encrypt, fresh_secret, open, participant_public};
+
+        async fn read(router: &Router, uri: &str) -> Value {
+            let (status, document) = request(router, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_str(&document).unwrap()
+        }
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let router = app(Connection::open(file.path()).unwrap()).unwrap();
+        let (flag, mut manifest) = generate(Map::new());
+        let defender = fresh_secret();
+        let defender_public = participant_public(&defender).unwrap();
+        manifest.defender_public_key = Some(defender_public.clone());
+        for invalid in ["not a key".to_owned(), manifest.public_key.clone()] {
+            let mut changed = manifest.clone();
+            changed.defender_public_key = Some(invalid);
+            assert_eq!(
+                request(&router, Method::POST, "/dossiers", Some(json!(changed)))
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        let alice = fresh_secret();
+        let alice_report = open(&flag, &defender_public, &alice, "Alice's report").unwrap();
+        let bob_report = open(&flag, &defender_public, &fresh_secret(), "Bob's report").unwrap();
+        for (report, status) in [
+            (&alice_report, StatusCode::CREATED),
+            (&alice_report, StatusCode::OK),
+            (&bob_report, StatusCode::CREATED),
+        ] {
+            assert_eq!(
+                request(&router, Method::POST, "/threads", Some(json!(report)))
+                    .await
+                    .0,
+                status
+            );
+        }
+
+        // A second opening with Alice's ID must leave neither an extra thread nor a proof.
+        let conflicting = open(&flag, &defender_public, &alice, "new opening").unwrap();
+        assert_eq!(
+            request(&router, Method::POST, "/threads", Some(json!(conflicting)))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let route = format!("/dossiers/{}", manifest.public_key);
+        assert_eq!(
+            read(&router, &format!("{route}/proofs")).await,
+            json!([alice_report.proof, bob_report.proof])
+        );
+
+        let entries = format!("/threads/{}/messages", alice_report.participants.finder);
+        let reply = encrypt(
+            &alice_report.participants,
+            &defender,
+            "DEF's reply to Alice",
+        )
+        .unwrap();
+        let wrong = format!("/threads/{}/messages", bob_report.participants.finder);
+        assert_eq!(
+            request(&router, Method::POST, &wrong, Some(json!(reply)))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(
+                &router,
+                Method::POST,
+                &entries,
+                Some(json!(alice_report.first))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for status in [StatusCode::CREATED, StatusCode::OK] {
+            assert_eq!(
+                request(&router, Method::POST, &entries, Some(json!(reply)))
+                    .await
+                    .0,
+                status
+            );
+        }
+
+        // These submissions would expose a note to the public or all holders of the flag.
+        for (route, body) in [
+            (
+                "/proofs",
+                json!(prove(&flag, "public note".into()).unwrap()),
+            ),
+            (
+                "/proofs",
+                json!(prove_with_reply(&flag, String::new(), "shared note").unwrap()),
+            ),
+            (
+                "/records",
+                json!(encrypt_message(&flag, "legacy message").unwrap()),
+            ),
+        ] {
+            assert_eq!(
+                request(&router, Method::POST, route, Some(body)).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let bare = prove(&flag, String::new()).unwrap();
+        assert_eq!(
+            request(&router, Method::POST, "/proofs", Some(json!(bare)))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+
+        drop(router);
+        let reopened = app(Connection::open(file.path()).unwrap()).unwrap();
+        assert_eq!(
+            read(&reopened, &format!("{route}/threads")).await,
+            json!([alice_report, bob_report])
+        );
+        let alice_thread = format!("/threads/{}", alice_report.participants.finder);
+        assert_eq!(read(&reopened, &alice_thread).await, json!(alice_report));
+        assert_eq!(read(&reopened, &entries).await, json!([reply]));
+        assert_eq!(read(&reopened, &wrong).await, json!([]));
+        assert_eq!(
+            read(&reopened, &format!("{route}/messages")).await,
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_freeform_metadata_does_not_enable_private_mode() {
+        let router = app(Connection::open_in_memory().unwrap()).unwrap();
+        let mut metadata = Map::new();
+        metadata.insert(
+            "defender_public_key".into(),
+            json!("legacy application data"),
+        );
+        let (flag, manifest) = generate(metadata);
+        let proof = prove_with_reply(&flag, String::new(), "shared note").unwrap();
+        for (uri, body) in [("/dossiers", json!(manifest)), ("/proofs", json!(proof))] {
+            assert_eq!(
+                request(&router, Method::POST, uri, Some(body)).await.0,
+                StatusCode::CREATED
+            );
+        }
     }
 
     #[tokio::test]
