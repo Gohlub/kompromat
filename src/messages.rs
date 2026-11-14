@@ -10,11 +10,10 @@ use schnorrkel::Signature;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::{Key, decode, public_key};
+use crate::{Key, MAX_MESSAGE_BYTES, decode, public_key};
 
 pub(crate) const CONTEXT: &[u8] = b"kompromat:record:v1";
 const KEY_CONTEXT: &[u8] = b"kompromat:record:encryption:v1";
-const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +25,10 @@ pub struct EncryptedMessage {
 }
 
 pub fn encrypt_message(key: &Key, message: &str) -> Result<EncryptedMessage> {
+    ensure!(
+        key.defender_public_key.is_none(),
+        "this flag uses private finder dossiers"
+    );
     ensure!(message.len() <= MAX_MESSAGE_BYTES, "message exceeds 16 KiB");
     let keypair = key.keypair()?;
     let public = keypair.public.to_bytes();
@@ -121,12 +124,12 @@ pub(crate) fn signed_bytes(entry: &EncryptedMessage) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Manifest, Proof, generate, prove, verify};
+    use crate::{Manifest, Proof, generate_shared, prove, verify};
     use serde_json::Map;
 
     #[test]
     fn same_key_file_unlocks_randomized_messages() {
-        let (key, public) = generate(Map::new());
+        let (key, public) = generate_shared(Map::new());
         let copy: Key = serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
         for message in ["", "Follow the instructions here.\n🦀"] {
             let entry = encrypt_message(&key, message).unwrap();
@@ -141,8 +144,8 @@ mod tests {
 
     #[test]
     fn wrong_key_tampering_and_invalid_aead_fail() {
-        let (key, public) = generate(Map::new());
-        let (other, _) = generate(Map::new());
+        let (key, public) = generate_shared(Map::new());
+        let (other, _) = generate_shared(Map::new());
         let entry = encrypt_message(&key, "private instructions").unwrap();
         assert!(decrypt_message(&other, &entry).is_err());
         let mut changed = entry.clone();
@@ -166,7 +169,7 @@ mod tests {
 
     #[test]
     fn public_proofs_and_message_writes_are_separate_protocols() {
-        let (key, public) = generate(Map::new());
+        let (key, public) = generate_shared(Map::new());
         let mut entry = encrypt_message(&key, "private").unwrap();
         let public_proof = prove(&key, hex::encode(signed_bytes(&entry).unwrap())).unwrap();
         let original_signature = entry.signature.clone();
@@ -191,6 +194,7 @@ mod tests {
                 &proof,
                 &Manifest {
                     public_key: public.public_key,
+                    defender_public_key: None,
                     metadata: Map::new()
                 }
             )

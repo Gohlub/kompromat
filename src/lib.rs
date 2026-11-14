@@ -2,6 +2,8 @@
 
 pub mod api;
 mod messages;
+pub mod publication;
+pub mod threads;
 
 pub use messages::{EncryptedMessage, decrypt_message, encrypt_message, verify_message};
 
@@ -14,13 +16,16 @@ use serde_json::{Map, Value};
 const CONTEXT: &[u8] = b"kompromat:proof:v1";
 const REPLY_CONTEXT: &[u8] = b"kompromat:proof-reply:v1";
 pub const DEFAULT_API: &str = "http://127.0.0.1:3000";
+/// Maximum UTF-8 plaintext size for an encrypted note.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const PRIVATE_REPORTING_INSTRUCTIONS: &str = "Keep this file and its secret local. Use the registry's hunt URL with `kompromat report PATH_TO_THIS_FILE --hunt HUNT_URL --message-stdin < writeup.txt`. Save the dossier key to read and reply.";
 
 fn default_api() -> String {
     DEFAULT_API.into()
 }
 
 fn reporting_instructions() -> String {
-    "Found this key? Install the CLI: curl -fsSL https://kompromat.sh/cli | sh. Report access with: kompromat report PATH_TO_THIS_FILE. Or generate a proof locally and use the HTTP instructions in submission. Never upload this key file or secret_key. Optionally add --reply \"your message\" for an encrypted response.".into()
+    "Report access with: kompromat report PATH_TO_THIS_FILE. To include a shared note, add --hunt HUNT_URL --message 'your note'. Use the hunt URL from the registry. Never upload this file.".into()
 }
 
 /// Public, self-contained directions for submitting proof of access.
@@ -47,7 +52,7 @@ impl Submission {
             method: "POST".into(),
             content_type: "application/json".into(),
             cli: "kompromat report PATH_TO_THIS_FILE".into(),
-            proof_format: "Generate proof.json locally: kompromat prove PATH_TO_THIS_FILE > proof.json. To include an encrypted note, add --reply to the prove command with the note as its argument. For a proof without a note, an independent client can decode secret_key as a 32-byte Schnorrkel MiniSecretKey, expand with ExpansionMode::Ed25519, and sign the empty byte string using context kompromat:proof:v1. Keep the template's message field empty. Encode the public key (32 bytes) and signature (64 bytes) as lowercase hex. Do not send secret_key.".into(),
+            proof_format: "kompromat prove PATH_TO_THIS_FILE > proof.json. For a shared note add --manifest TRUSTED_MANIFEST --message 'your note'. Bare proof: expand the 32-byte Schnorrkel MiniSecretKey with ExpansionMode::Ed25519 and sign the empty message under kompromat:proof:v1. Use lowercase hex for the public key and signature. Never send secret_key.".into(),
             body: serde_json::json!({"public_key": public_key, "message": "", "signature": "<locally generated Schnorr signature>"}),
         }
     }
@@ -58,6 +63,9 @@ impl Submission {
 #[serde(deny_unknown_fields)]
 pub struct Key {
     pub secret_key: String,
+    /// Pins the defender who receives private reports. Shared-format flags omit this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defender_public_key: Option<String>,
     #[serde(default = "default_api")]
     pub api: String,
     #[serde(default = "reporting_instructions")]
@@ -83,8 +91,21 @@ impl Key {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defender_public_key: Option<String>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
+}
+
+impl Manifest {
+    /// Match a found flag to an independently obtained hunt manifest.
+    pub fn verify_flag(&self, public_key: &str, defender: Option<&str>) -> Result<()> {
+        ensure!(
+            self.public_key == public_key && self.defender_public_key.as_deref() == defender,
+            "flag does not match the registered hunt"
+        );
+        Ok(())
+    }
 }
 
 // Compatibility with callers of the original Rust API.
@@ -102,31 +123,72 @@ pub struct Proof {
     pub reply: Option<EncryptedMessage>,
 }
 
-pub fn generate(metadata: Map<String, Value>) -> (Key, Manifest) {
+/// Generate a flag, its public manifest, and the defender key for reading reports.
+pub fn generate(metadata: Map<String, Value>) -> Result<(Key, Manifest, String)> {
     generate_for_api(metadata, DEFAULT_API)
 }
 
-pub fn generate_for_api(mut metadata: Map<String, Value>, api: &str) -> (Key, Manifest) {
+/// Generate the same keys and manifest with the supplied registry URL.
+pub fn generate_for_api(
+    metadata: Map<String, Value>,
+    api: &str,
+) -> Result<(Key, Manifest, String)> {
+    ensure!(
+        !metadata.contains_key("submission"),
+        "private reports use the registered hunt's /report endpoint"
+    );
+    let (secret, public) = generate_keypair();
+    let (flag, manifest) = generate_flag(metadata, api, Some(public));
+    Ok((flag, manifest, secret))
+}
+
+/// Generate a shared dossier readable by everyone who holds its flag.
+pub fn generate_shared(metadata: Map<String, Value>) -> (Key, Manifest) {
+    generate_shared_for_api(metadata, DEFAULT_API)
+}
+
+pub fn generate_shared_for_api(metadata: Map<String, Value>, api: &str) -> (Key, Manifest) {
+    generate_flag(metadata, api, None)
+}
+
+fn generate_keypair() -> (String, String) {
     let secret = MiniSecretKey::generate();
     let keypair = secret.expand_to_keypair(ExpansionMode::Ed25519);
-    let public_key = hex::encode(keypair.public.to_bytes());
-    let submission = Submission::new(api, &public_key);
-    let instructions = reporting_instructions();
+    (
+        hex::encode(secret.to_bytes()),
+        hex::encode(keypair.public.to_bytes()),
+    )
+}
+
+fn generate_flag(
+    mut metadata: Map<String, Value>,
+    api: &str,
+    defender_public_key: Option<String>,
+) -> (Key, Manifest) {
+    let (secret_key, public_key) = generate_keypair();
+    let (instructions, submission) = if defender_public_key.is_some() {
+        (PRIVATE_REPORTING_INSTRUCTIONS.into(), None)
+    } else {
+        let submission = Submission::new(api, &public_key);
+        metadata
+            .entry("submission")
+            .or_insert_with(|| serde_json::json!(submission));
+        (reporting_instructions(), Some(submission))
+    };
     metadata
         .entry("instructions")
         .or_insert_with(|| Value::String(instructions.clone()));
-    metadata
-        .entry("submission")
-        .or_insert_with(|| serde_json::json!(submission));
     (
         Key {
-            secret_key: hex::encode(secret.to_bytes()),
+            secret_key,
+            defender_public_key: defender_public_key.clone(),
             api: api.into(),
             instructions,
-            submission: Some(submission),
+            submission,
         },
         Manifest {
             public_key,
+            defender_public_key,
             metadata,
         },
     )
@@ -220,8 +282,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_manifest_preserves_the_brief_and_omits_shared_submission() {
+        let mut metadata = Map::new();
+        metadata.insert("instructions".into(), Value::String("hunt brief".into()));
+        let (flag, manifest, defender_secret) = generate(metadata).unwrap();
+        let defender = threads::participant_public(&defender_secret).unwrap();
+        assert_eq!(flag.defender_public_key.as_ref(), Some(&defender));
+        assert_eq!(manifest.defender_public_key.as_ref(), Some(&defender));
+        assert_eq!(manifest.metadata["instructions"], "hunt brief");
+        assert_eq!(flag.instructions, PRIVATE_REPORTING_INSTRUCTIONS);
+        assert!(!manifest.metadata.contains_key("submission"));
+        assert!(flag.submission.is_none());
+    }
+
+    #[test]
     fn proof_roundtrip_keeps_secret_local() {
-        let (key, public) = generate(Map::new());
+        let (key, public, _) = generate(Map::new()).unwrap();
         let proof = prove(&key, "found in the archive".into()).unwrap();
         let json = serde_json::to_string(&proof).unwrap();
         let restored: Proof = serde_json::from_str(&json).unwrap();
@@ -240,7 +316,7 @@ mod tests {
 
     #[test]
     fn tampering_and_wrong_manifests_fail() {
-        let (key, public) = generate(Map::new());
+        let (key, public, _) = generate(Map::new()).unwrap();
         let proof = prove(&key, "original".into()).unwrap();
         let mut changed = proof.clone();
         changed.message.push('!');
@@ -255,7 +331,7 @@ mod tests {
             },
         );
         assert!(verify(&changed, &public).is_err());
-        let (_, other) = generate(Map::new());
+        let (_, other, _) = generate(Map::new()).unwrap();
         assert!(verify(&proof, &other).is_err());
         changed = proof;
         changed.public_key = other.public_key.clone();
@@ -271,6 +347,7 @@ mod tests {
             prove(
                 &Key {
                     secret_key: "bad".into(),
+                    defender_public_key: None,
                     api: default_api(),
                     instructions: reporting_instructions(),
                     submission: None,
@@ -287,6 +364,7 @@ mod tests {
         let keypair = secret.expand_to_keypair(ExpansionMode::Ed25519);
         let public = Manifest {
             public_key: hex::encode(keypair.public.to_bytes()),
+            defender_public_key: None,
             metadata: Map::new(),
         };
         let proof = Proof {
@@ -299,8 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn private_reply_is_bound_to_the_proof_and_stays_encrypted() {
-        let (key, public) = generate(Map::new());
+    fn shared_reply_is_bound_to_the_proof_and_stays_encrypted() {
+        let (key, public) = generate_shared(Map::new());
         let proof = prove_with_reply(&key, "I found it".into(), "The private details").unwrap();
         verify(&proof, &public).unwrap();
         assert_eq!(
@@ -327,7 +405,7 @@ mod tests {
         assert!(verify(&legacy, &public).is_err());
 
         // Even a valid outer signature cannot authorize a reply for another key.
-        let (other, _) = generate(Map::new());
+        let (other, _) = generate_shared(Map::new());
         let wrong_key = sign_proof(
             &key,
             String::new(),

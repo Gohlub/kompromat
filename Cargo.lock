@@ -856,6 +856,7 @@ dependencies = [
  "clap",
  "hex",
  "hkdf",
+ "libc",
  "reqwest",
  "rusqlite",
  "schnorrkel",
