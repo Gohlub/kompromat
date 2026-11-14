@@ -21,7 +21,6 @@ they made the proof. Reading the flag itself is silent.
 Each report opens a **dossier** where you and that finder can exchange encrypted
 notes. The CLI saves a dossier key for the finder. Your defender key opens all
 the dossiers for this flag. Keep those keys backed up outside the target.
-Older shared flags let anyone holding a copy read their shared notes.
 
 ## What the API does
 
@@ -31,7 +30,9 @@ sends a signed proof and encrypted note to `POST /report`. The API verifies
 the proof and returns the submission with a receipt giving its dossier ID,
 order of arrival and time.
 
-The first note is at `/threads/{id}` and replies are at `/threads/{id}/messages`.
+`GET /threads/{id}` returns the opening and its receipt. Replies are at
+`/threads/{id}/messages`. Lists use `{items, next_after}`; pass `after` to
+continue from the returned cursor.
 The API stores the notes as ciphertext. Anyone with the hunt URL can see the
 dossier IDs, when reports arrived, which side sent each note and its size.
 

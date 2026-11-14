@@ -74,9 +74,7 @@ async fn status(
     Path(flag): Path<String>,
 ) -> Result<Json<PublicationState>, ApiError> {
     let connection = database.lock().map_err(internal)?;
-    find_manifest(&connection, &flag)?
-        .defender_public_key
-        .ok_or_else(|| bad_request("only hunts with a defender key can be listed"))?;
+    find_manifest(&connection, &flag)?;
     Ok(Json(current(&connection, &flag)?))
 }
 
@@ -85,9 +83,7 @@ async fn change(
     Path(flag): Path<String>,
     Json(change): Json<SignedPublication>,
 ) -> Result<Json<PublicationState>, ApiError> {
-    let defender = registered_manifest(&database, &flag)?
-        .defender_public_key
-        .ok_or_else(|| bad_request("only hunts with a defender key can be listed"))?;
+    let defender = registered_manifest(&database, &flag)?.defender_public_key;
     change.verify(&defender, &flag).map_err(bad_request)?;
     let state = change.state;
     let mut connection = database.lock().map_err(internal)?;

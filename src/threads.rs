@@ -1,7 +1,7 @@
 //! Per-finder dossiers. A flag authorizes the opening; only the finder and the
 //! defender have the keys for the conversation, starting with its first note.
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use chacha20poly1305::{
     XChaCha20Poly1305,
     aead::{Aead, AeadCore, OsRng, Payload},
@@ -46,8 +46,8 @@ pub struct CaptureReceipt {
     pub dossier_id: String,
     /// First accepted report for this flag is 1. Retries preserve this value.
     pub sequence: i64,
-    /// Server UTC time. Older reports predate timestamp collection.
-    pub accepted_at: Option<String>,
+    /// Server UTC time when the report was first accepted.
+    pub accepted_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,13 +190,10 @@ fn opening_claim(p: &Participants, first: &ThreadMessage) -> Result<String> {
 /// Encrypt the first write-up to the defender in an independently obtained hunt manifest.
 pub fn open(flag: &Key, manifest: &Manifest, finder_secret: &str, text: &str) -> Result<Opening> {
     let public_key = flag.public_key()?;
-    manifest.verify_flag(&public_key, flag.defender_public_key.as_deref())?;
+    manifest.verify_flag(&public_key, &flag.defender_public_key)?;
     let participants = Participants {
         flag: public_key,
-        defender: manifest
-            .defender_public_key
-            .clone()
-            .context("this hunt has no private dossier recipient")?,
+        defender: manifest.defender_public_key.clone(),
         finder: participant_public(finder_secret)?,
     };
     let first = encrypt(&participants, finder_secret, text)?;
@@ -215,7 +212,7 @@ pub fn verify_opening(opening: &Opening, manifest: &Manifest) -> Result<()> {
         "opening belongs to another flag"
     );
     ensure!(
-        manifest.defender_public_key.as_deref() == Some(p.defender.as_str()),
+        manifest.defender_public_key == p.defender,
         "defender key differs from the manifest"
     );
     ensure!(
@@ -224,7 +221,7 @@ pub fn verify_opening(opening: &Opening, manifest: &Manifest) -> Result<()> {
     );
     verify_entry(p, &opening.first)?;
     ensure!(
-        opening.proof.reply.is_none() && opening.proof.message == opening_claim(p, &opening.first)?,
+        opening.proof.message == opening_claim(p, &opening.first)?,
         "opening proof does not bind this finder dossier"
     );
     verify(&opening.proof, manifest)
@@ -237,7 +234,7 @@ mod tests {
 
     #[test]
     fn each_finder_and_defender_can_read_only_their_exchange() {
-        let (flag, mut manifest, defender) = crate::generate(Map::new()).unwrap();
+        let (flag, mut manifest, defender) = crate::generate(Map::new());
 
         let alice = fresh_secret();
         let bob = fresh_secret();
@@ -273,35 +270,33 @@ mod tests {
         assert!(verify_entry(&a.participants, &splice.first).is_err());
         assert!(verify_opening(&splice, &manifest).is_err());
 
-        manifest.defender_public_key = Some(b.participants.finder);
+        manifest.defender_public_key = b.participants.finder;
         assert!(open(&flag, &manifest, &alice, "wrong defender").is_err());
         assert!(verify_opening(&a, &manifest).is_err());
     }
 
     #[test]
     fn opening_requires_the_private_flag_from_the_registered_hunt() {
-        let (mut flag, manifest, _) = crate::generate(Map::new()).unwrap();
+        let (mut flag, manifest, _) = crate::generate(Map::new());
         let finder = fresh_secret();
         let mut other = manifest.clone();
         other.public_key = participant_public(&finder).unwrap();
         assert!(open(&flag, &other, &finder, "").is_err());
-        flag.defender_public_key = None;
+        flag.defender_public_key = participant_public(&finder).unwrap();
         assert!(open(&flag, &manifest, &finder, "").is_err());
-        let (shared, shared_manifest) = crate::generate_shared(Map::new());
-        assert!(open(&shared, &shared_manifest, &finder, "").is_err());
     }
 
     #[test]
     fn reject_keys_which_collapse_roles_and_invalid_encodings() {
-        let (mut flag, mut manifest, defender) = crate::generate(Map::new()).unwrap();
+        let (mut flag, mut manifest, defender) = crate::generate(Map::new());
         let finder = fresh_secret();
         assert!(open(&flag, &manifest, &defender, "").is_err());
         assert!(open(&flag, &manifest, &flag.secret_key, "").is_err());
         let too_long = "a".repeat(MAX_MESSAGE_BYTES + 1);
         assert!(open(&flag, &manifest, &finder, &too_long).is_err());
         for invalid in [flag.public_key().unwrap(), "00".repeat(32)] {
-            manifest.defender_public_key = Some(invalid.clone());
-            flag.defender_public_key = Some(invalid);
+            manifest.defender_public_key = invalid.clone();
+            flag.defender_public_key = invalid;
             assert!(open(&flag, &manifest, &finder, "").is_err());
         }
     }

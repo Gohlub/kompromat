@@ -4,96 +4,35 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
-    ApiError, Database, PageQuery, bad_request, find_manifest, insert_proof, internal, read_json,
+    ApiError, Database, PageQuery, bad_request, find_manifest, internal, read_json,
     registered_manifest,
 };
 use crate::threads::{
-    AcceptedOpening, CaptureReceipt, Opening, Page, Participants, ThreadMessage, verify_entry,
-    verify_opening,
+    AcceptedOpening, CaptureReceipt, Opening, Page, ThreadMessage, verify_entry, verify_opening,
 };
 
 pub(super) fn initialize(connection: &Connection) -> rusqlite::Result<()> {
-    let tx = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-    tx.execute_batch(
+    connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS finder_threads (
             finder TEXT PRIMARY KEY,
-            flag TEXT NOT NULL,
-            proof_signature TEXT NOT NULL,
-            first_entry TEXT NOT NULL,
-            UNIQUE (flag, proof_signature),
-            FOREIGN KEY (flag, proof_signature) REFERENCES proofs(public_key, signature)
+            flag TEXT NOT NULL REFERENCES canaries(public_key),
+            document TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            accepted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (flag, sequence)
          );
          CREATE TABLE IF NOT EXISTS thread_entries (
             finder TEXT NOT NULL REFERENCES finder_threads(finder),
             nonce TEXT NOT NULL,
             document TEXT NOT NULL,
-            PRIMARY KEY (finder, nonce)
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            PRIMARY KEY (finder, nonce),
+            UNIQUE (finder, sequence)
          );",
-    )?;
-    let has_sequence: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('finder_threads') WHERE name = 'sequence')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_sequence {
-        // Recover the order the old inbox showed. Its schema recorded no clock time.
-        tx.execute_batch(
-            "ALTER TABLE finder_threads ADD COLUMN sequence INTEGER CHECK (sequence > 0);
-             ALTER TABLE finder_threads ADD COLUMN accepted_at TEXT;
-             WITH ordered AS MATERIALIZED (
-                 SELECT finder, row_number() OVER (PARTITION BY flag ORDER BY rowid) AS position
-                 FROM finder_threads
-             )
-             UPDATE finder_threads SET sequence = (
-                 SELECT position FROM ordered WHERE ordered.finder = finder_threads.finder
-             );
-             CREATE UNIQUE INDEX finder_receipt_order ON finder_threads(flag, sequence);
-             CREATE TRIGGER issue_finder_receipt AFTER INSERT ON finder_threads
-             BEGIN
-                 UPDATE finder_threads
-                 SET sequence = (SELECT coalesce(max(sequence), 0) + 1 FROM finder_threads WHERE flag = NEW.flag),
-                     accepted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE finder = NEW.finder;
-             END;",
-        )?;
-    }
-    for (table, owner) in [
-        ("thread_entries", "finder"),
-        ("record_entries", "public_key"),
-        ("proofs", "public_key"),
-    ] {
-        let has_sequence: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = 'sequence')",
-            [table],
-            |row| row.get(0),
-        )?;
-        if has_sequence {
-            continue;
-        }
-        // All identifiers come from the schema above. Preserve each original insertion order.
-        tx.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN sequence INTEGER CHECK (sequence > 0);
-             WITH ordered AS MATERIALIZED (
-                 SELECT rowid AS id, row_number() OVER (PARTITION BY {owner} ORDER BY rowid) AS n
-                 FROM {table}
-             )
-             UPDATE {table} SET sequence = (
-                 SELECT n FROM ordered WHERE ordered.id = {table}.rowid
-             );
-             CREATE UNIQUE INDEX {table}_order ON {table}({owner}, sequence);
-             CREATE TRIGGER number_{table} AFTER INSERT ON {table}
-             BEGIN
-                 UPDATE {table}
-                 SET sequence = (SELECT coalesce(max(sequence), 0) + 1 FROM {table} WHERE {owner} = NEW.{owner})
-                 WHERE rowid = NEW.rowid;
-             END;",
-        ))?;
-    }
-    tx.commit()
+    )
 }
 
 pub(super) fn routes() -> Router<Database> {
@@ -102,29 +41,6 @@ pub(super) fn routes() -> Router<Database> {
         .route("/dossiers/{public_key}/threads", get(list))
         .route("/threads/{finder}", get(get_thread))
         .route("/threads/{finder}/messages", get(messages).post(append))
-}
-
-#[derive(Deserialize)]
-struct ReceiptQuery {
-    #[serde(default)]
-    receipt: bool,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum OpeningView {
-    Opening(Opening),
-    Accepted(AcceptedOpening),
-}
-
-impl ReceiptQuery {
-    fn view(&self, accepted: AcceptedOpening) -> OpeningView {
-        if self.receipt {
-            OpeningView::Accepted(accepted)
-        } else {
-            OpeningView::Opening(accepted.opening)
-        }
-    }
 }
 
 async fn open(
@@ -138,16 +54,16 @@ async fn open(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(internal)?;
-    insert_proof(&tx, &opening.proof)?;
     let inserted = tx
         .execute(
-            "INSERT INTO finder_threads (finder, flag, proof_signature, first_entry)
-             VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+            "INSERT INTO finder_threads (finder, flag, document, sequence)
+             VALUES (?1, ?2, ?3,
+                 (SELECT coalesce(max(sequence), 0) + 1 FROM finder_threads WHERE flag = ?2))
+             ON CONFLICT (finder) DO NOTHING",
             params![
                 opening.participants.finder,
                 opening.participants.flag,
-                opening.proof.signature,
-                serde_json::to_string(&opening.first).map_err(internal)?,
+                serde_json::to_string(&opening).map_err(internal)?,
             ],
         )
         .map_err(internal)?;
@@ -164,28 +80,13 @@ async fn open(
     Ok((status, Json(accepted)))
 }
 
-// Reconstitute the signed opening from the immutable manifest, proof and first entry.
-const OPENINGS: &str = "SELECT t.flag, json_extract(c.document, '$.defender_public_key'),
-            t.finder, t.first_entry, p.document, t.sequence, t.accepted_at
-     FROM finder_threads AS t
-     JOIN canaries AS c ON c.public_key = t.flag
-     JOIN proofs AS p ON p.public_key = t.flag AND p.signature = t.proof_signature";
-
 fn read_opening(row: &Row<'_>) -> rusqlite::Result<AcceptedOpening> {
-    let opening = Opening {
-        participants: Participants {
-            flag: row.get(0)?,
-            defender: row.get(1)?,
-            finder: row.get(2)?,
-        },
-        first: read_json(row, 3)?,
-        proof: read_json(row, 4)?,
-    };
+    let opening: Opening = read_json(row, 0)?;
     Ok(AcceptedOpening {
         receipt: CaptureReceipt {
             dossier_id: opening.participants.finder.clone(),
-            sequence: row.get(5)?,
-            accepted_at: row.get(6)?,
+            sequence: row.get(1)?,
+            accepted_at: row.get(2)?,
         },
         opening,
     })
@@ -194,7 +95,7 @@ fn read_opening(row: &Row<'_>) -> rusqlite::Result<AcceptedOpening> {
 fn find_thread(connection: &Connection, finder: &str) -> Result<AcceptedOpening, ApiError> {
     connection
         .query_row(
-            &format!("{OPENINGS} WHERE t.finder = ?1"),
+            "SELECT document, sequence, accepted_at FROM finder_threads WHERE finder = ?1",
             [finder],
             read_opening,
         )
@@ -206,10 +107,9 @@ fn find_thread(connection: &Connection, finder: &str) -> Result<AcceptedOpening,
 async fn get_thread(
     State(database): State<Database>,
     Path(finder): Path<String>,
-    Query(query): Query<ReceiptQuery>,
-) -> Result<Json<OpeningView>, ApiError> {
+) -> Result<Json<AcceptedOpening>, ApiError> {
     let connection = database.lock().map_err(internal)?;
-    Ok(Json(query.view(find_thread(&connection, &finder)?)))
+    Ok(Json(find_thread(&connection, &finder)?))
 }
 
 async fn list(
@@ -253,7 +153,9 @@ async fn append(
         .map_err(internal)?;
     let inserted = tx
         .execute(
-            "INSERT INTO thread_entries (finder, nonce, document) VALUES (?1, ?2, ?3)
+            "INSERT INTO thread_entries (finder, nonce, document, sequence)
+             VALUES (?1, ?2, ?3,
+                 (SELECT coalesce(max(sequence), 0) + 1 FROM thread_entries WHERE finder = ?1))
              ON CONFLICT (finder, nonce) DO NOTHING",
             params![
                 finder,
@@ -311,91 +213,125 @@ async fn messages(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::{generate, threads};
 
-    #[test]
-    fn older_dossiers_keep_their_per_flag_order_without_invented_times() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE proofs (
-                 public_key TEXT, signature TEXT, PRIMARY KEY (public_key, signature)
-             );
-             CREATE TABLE finder_threads (
-                 finder TEXT PRIMARY KEY, flag TEXT NOT NULL, proof_signature TEXT NOT NULL,
-                 first_entry TEXT NOT NULL, UNIQUE (flag, proof_signature),
-                 FOREIGN KEY (flag, proof_signature) REFERENCES proofs(public_key, signature)
-             );
-             CREATE TABLE thread_entries (
-                 finder TEXT NOT NULL, nonce TEXT NOT NULL, document TEXT NOT NULL,
-                 PRIMARY KEY (finder, nonce)
-             );
-             CREATE TABLE record_entries (
-                 public_key TEXT NOT NULL, nonce TEXT NOT NULL, document TEXT NOT NULL,
-                 PRIMARY KEY (public_key, nonce)
-             );",
-        )
-        .unwrap();
-        let insert = |flag: &str, finder: &str| {
-            db.execute(
-                "INSERT OR IGNORE INTO proofs (public_key, signature) VALUES (?1, ?2)",
-                [flag, finder],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO finder_threads (flag, finder, proof_signature, first_entry)
-                 VALUES (?1, ?2, ?2, '{}') ON CONFLICT DO NOTHING",
-                [flag, finder],
-            )
-            .unwrap()
+    #[tokio::test]
+    async fn receipts_and_message_order_survive_restart_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("records.sqlite3");
+        let connect = || {
+            // Use the application's real startup path, including foreign keys and schema setup.
+            drop(crate::api::app(Connection::open(&path).unwrap()).unwrap());
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .unwrap();
+            Arc::new(Mutex::new(connection))
         };
-        let receipt = |finder: &str| -> (i64, Option<String>) {
-            db.query_row(
-                "SELECT sequence, accepted_at FROM finder_threads WHERE finder = ?1",
-                [finder],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-        };
-
-        insert("flag-a", "z");
-        insert("flag-b", "a");
-        insert("flag-a", "y");
-        db.execute_batch(
-            "INSERT INTO thread_entries VALUES ('z', 'one', '{}'), ('a', 'two', '{}'), ('z', 'three', '{}');",
+        let database = connect();
+        let (flag, manifest, _) = generate(Default::default());
+        let (other_flag, other_manifest, _) = generate(Default::default());
+        for manifest in [&manifest, &other_manifest] {
+            database
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO canaries (public_key, document) VALUES (?1, ?2)",
+                    params![
+                        manifest.public_key,
+                        serde_json::to_string(manifest).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        let secret = threads::fresh_secret();
+        let first = threads::open(&flag, &manifest, &secret, "first report").unwrap();
+        let other = threads::open(
+            &other_flag,
+            &other_manifest,
+            &threads::fresh_secret(),
+            "other flag",
         )
         .unwrap();
-        initialize(&db).unwrap();
-        assert_eq!(receipt("z"), (1, None));
-        assert_eq!(receipt("a"), (1, None));
-        assert_eq!(receipt("y"), (2, None));
-        assert_eq!(insert("flag-a", "c"), 1);
-        let issued = receipt("c");
-        let utc = issued.1.as_deref().unwrap();
-        assert_eq!(issued.0, 3);
-        assert!(utc.len() == 24 && utc.ends_with('Z'));
+        let second =
+            threads::open(&flag, &manifest, &threads::fresh_secret(), "second report").unwrap();
+        let mut accepted = Vec::new();
+        for opening in [&first, &other, &second] {
+            let (status, Json(response)) = open(State(database.clone()), Json(opening.clone()))
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::CREATED);
+            assert!(response.receipt.accepted_at.ends_with('Z'));
+            accepted.push(response);
+        }
+        assert_eq!(accepted[0].receipt.sequence, 1);
+        assert_eq!(accepted[1].receipt.sequence, 1);
+        assert_eq!(accepted[2].receipt.sequence, 2);
 
-        initialize(&db).unwrap();
-        db.execute_batch(
-            "INSERT INTO thread_entries (finder, nonce, document) VALUES ('z', 'four', '{}');
-             VACUUM;",
-        )
-        .unwrap();
-        let order: Vec<(String, i64)> = db
-            .prepare(
-                "SELECT nonce, sequence FROM thread_entries WHERE finder = 'z' ORDER BY sequence",
+        let reply = threads::encrypt(&first.participants, &secret, "first reply").unwrap();
+        let finder = first.participants.finder.clone();
+        for expected in [StatusCode::CREATED, StatusCode::OK] {
+            let (status, _) = append(
+                State(database.clone()),
+                Path(finder.clone()),
+                Json(reply.clone()),
             )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
+            .await
             .unwrap();
-        assert_eq!(
-            order,
-            [("one".into(), 1), ("three".into(), 2), ("four".into(), 3)]
-        );
-        assert_eq!(insert("flag-a", "c"), 0);
-        assert_eq!(receipt("c"), issued);
-        assert_eq!(insert("flag-b", "d"), 1);
-        assert_eq!(receipt("d").0, 2);
+            assert_eq!(status, expected);
+        }
+        database.lock().unwrap().execute_batch("VACUUM;").unwrap();
+        drop(database);
+
+        let database = connect();
+        let (status, Json(retried)) = open(State(database.clone()), Json(first.clone()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retried, accepted[0]);
+        for (flag, manifest, sequence) in [(&flag, &manifest, 3), (&other_flag, &other_manifest, 2)]
+        {
+            let opening =
+                threads::open(flag, manifest, &threads::fresh_secret(), "after restart").unwrap();
+            let (_, Json(response)) = open(State(database.clone()), Json(opening)).await.unwrap();
+            assert_eq!(response.receipt.sequence, sequence);
+        }
+        let last = threads::encrypt(&first.participants, &secret, "after restart").unwrap();
+        let (status, Json(stored)) = append(
+            State(database.clone()),
+            Path(finder.clone()),
+            Json(last.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(stored, last);
+        let Json(page) = messages(
+            State(database.clone()),
+            Path(finder.clone()),
+            Query(PageQuery {
+                after: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items, vec![reply]);
+        assert_eq!(page.next_after, Some(1));
+        let Json(page) = messages(
+            State(database),
+            Path(finder),
+            Query(PageQuery {
+                after: page.next_after,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items, vec![last]);
+        assert_eq!(page.next_after, None);
     }
 }
