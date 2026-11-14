@@ -31,7 +31,7 @@ main() {
     fi
 
     archive="kompromat-$target.tar.gz"
-    work_dir=$(mktemp -d)
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/kompromat-install.XXXXXXXX")
     staged_binary=
     trap 'rm -rf "$work_dir"; [ -z "$staged_binary" ] || rm -f "$staged_binary"' EXIT
     trap 'exit 1' HUP INT TERM

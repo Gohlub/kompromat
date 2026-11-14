@@ -57,6 +57,12 @@ pub struct AcceptedOpening {
     pub receipt: CaptureReceipt,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_after: Option<i64>,
+}
+
 pub fn fresh_secret() -> String {
     hex::encode(MiniSecretKey::generate().to_bytes())
 }

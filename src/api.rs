@@ -6,12 +6,14 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::threads::Page;
 use crate::{EncryptedMessage, Manifest, Proof, validate_public_key, verify, verify_message};
 
 type Database = Arc<Mutex<Connection>>;
@@ -114,6 +116,11 @@ fn find_manifest(connection: &Connection, public_key: &str) -> Result<Manifest, 
     serde_json::from_str(&document).map_err(internal)
 }
 
+fn registered_manifest(database: &Database, key: &str) -> Result<Manifest, ApiError> {
+    let connection = database.lock().map_err(internal)?;
+    find_manifest(&connection, key)
+}
+
 async fn register(
     State(database): State<Database>,
     Json(manifest): Json<Manifest>,
@@ -154,8 +161,7 @@ async fn get_manifest(
     State(database): State<Database>,
     Path(public_key): Path<String>,
 ) -> Result<Json<Manifest>, ApiError> {
-    let connection = database.lock().map_err(internal)?;
-    Ok(Json(find_manifest(&connection, &public_key)?))
+    Ok(Json(registered_manifest(&database, &public_key)?))
 }
 
 async fn submit(
@@ -163,14 +169,12 @@ async fn submit(
     Json(proof): Json<Proof>,
 ) -> Result<(StatusCode, Json<Proof>), ApiError> {
     validate_public_key(&proof.public_key).map_err(bad_request)?;
-    let mut connection = database.lock().map_err(internal)?;
-    let manifest = find_manifest(&connection, &proof.public_key)?;
-    if manifest.defender_public_key.is_some()
-        && (proof.reply.is_some() || !proof.message.is_empty())
-    {
-        return Err(bad_request("submit private reports to /threads"));
+    let manifest = registered_manifest(&database, &proof.public_key)?;
+    if manifest.defender_public_key.is_some() {
+        return Err(bad_request("submit private reports to /report"));
     }
     verify(&proof, &manifest).map_err(bad_request)?;
+    let mut connection = database.lock().map_err(internal)?;
     let transaction = connection.transaction().map_err(internal)?;
     let inserted = insert_proof(&transaction, &proof)?;
     if let Some(reply) = &proof.reply {
@@ -212,23 +216,97 @@ fn insert_proof(connection: &Connection, proof: &Proof) -> Result<bool, ApiError
     Ok(inserted == 1)
 }
 
+#[derive(Deserialize)]
+struct PageQuery {
+    after: Option<i64>,
+    limit: Option<u32>,
+}
+
+impl PageQuery {
+    fn read<T>(
+        &self,
+        connection: &Connection,
+        sql: &str,
+        key: &str,
+        item: impl Fn(&Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Json<Page<T>>, ApiError> {
+        const MAX_PAGE: u32 = 50;
+        let after = self.after.unwrap_or(0);
+        let limit = self.limit.unwrap_or(MAX_PAGE);
+        if after < 0 || !(1..=MAX_PAGE).contains(&limit) {
+            return Err(bad_request(
+                "expected after >= 0 and limit between 1 and 50",
+            ));
+        }
+        let mut statement = connection.prepare(sql).map_err(internal)?;
+        let mut rows = statement
+            .query(params![key, after, limit + 1])
+            .map_err(internal)?;
+        let mut items = Vec::new();
+        let mut last = None;
+        while let Some(row) = rows.next().map_err(internal)? {
+            if items.len() == limit as usize {
+                return Ok(Json(Page {
+                    items,
+                    next_after: last,
+                }));
+            }
+            last = Some(row.get(0).map_err(internal)?);
+            items.push(item(row).map_err(internal)?);
+        }
+        Ok(Json(Page {
+            items,
+            next_after: None,
+        }))
+    }
+}
+
+fn read_json<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlite::Result<T> {
+    let value: String = row.get(column)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum History<T> {
+    All(Vec<T>),
+    Page(Page<T>),
+}
+
+fn history<T: DeserializeOwned>(
+    database: &Database,
+    key: &str,
+    query: PageQuery,
+    sql: &str,
+) -> Result<Json<History<T>>, ApiError> {
+    let connection = database.lock().map_err(internal)?;
+    find_manifest(&connection, key)?;
+    let Json(page) = query.read(&connection, sql, key, |row| read_json(row, 1))?;
+    if query.after.is_some() || query.limit.is_some() {
+        return Ok(Json(History::Page(page)));
+    }
+    if page.next_after.is_some() {
+        return Err(bad_request(
+            "more than 50 entries; request ?after=0 to paginate",
+        ));
+    }
+    Ok(Json(History::All(page.items)))
+}
+
 async fn list_proofs(
     State(database): State<Database>,
     Path(public_key): Path<String>,
-) -> Result<Json<Vec<Proof>>, ApiError> {
-    let connection = database.lock().map_err(internal)?;
-    find_manifest(&connection, &public_key)?;
-    let mut statement = connection
-        .prepare("SELECT document FROM proofs WHERE public_key = ?1 ORDER BY rowid")
-        .map_err(internal)?;
-    let rows = statement
-        .query_map([public_key], |row| row.get::<_, String>(0))
-        .map_err(internal)?;
-    let mut proofs = Vec::new();
-    for row in rows {
-        proofs.push(serde_json::from_str(&row.map_err(internal)?).map_err(internal)?);
-    }
-    Ok(Json(proofs))
+    Query(query): Query<PageQuery>,
+) -> Result<Json<History<Proof>>, ApiError> {
+    history(
+        &database,
+        &public_key,
+        query,
+        "SELECT sequence, document FROM proofs
+         WHERE public_key = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
+    )
 }
 
 async fn append_message(
@@ -236,14 +314,14 @@ async fn append_message(
     Json(entry): Json<EncryptedMessage>,
 ) -> Result<(StatusCode, Json<EncryptedMessage>), ApiError> {
     validate_public_key(&entry.public_key).map_err(bad_request)?;
-    let connection = database.lock().map_err(internal)?;
-    let manifest = find_manifest(&connection, &entry.public_key)?;
+    let manifest = registered_manifest(&database, &entry.public_key)?;
     if manifest.defender_public_key.is_some() {
         return Err(bad_request(
             "append private messages to their finder thread",
         ));
     }
     verify_message(&entry, &manifest.public_key).map_err(bad_request)?;
+    let connection = database.lock().map_err(internal)?;
     let (status, stored) = store_message(&connection, &entry)?;
     Ok((status, Json(stored)))
 }
@@ -285,20 +363,15 @@ fn store_message(
 async fn list_messages(
     State(database): State<Database>,
     Path(public_key): Path<String>,
-) -> Result<Json<Vec<EncryptedMessage>>, ApiError> {
-    let connection = database.lock().map_err(internal)?;
-    find_manifest(&connection, &public_key)?;
-    let mut statement = connection
-        .prepare("SELECT document FROM record_entries WHERE public_key = ?1 ORDER BY rowid")
-        .map_err(internal)?;
-    let rows = statement
-        .query_map([public_key], |row| row.get::<_, String>(0))
-        .map_err(internal)?;
-    let mut entries = Vec::new();
-    for row in rows {
-        entries.push(serde_json::from_str(&row.map_err(internal)?).map_err(internal)?);
-    }
-    Ok(Json(entries))
+    Query(query): Query<PageQuery>,
+) -> Result<Json<History<EncryptedMessage>>, ApiError> {
+    history(
+        &database,
+        &public_key,
+        query,
+        "SELECT sequence, document FROM record_entries
+         WHERE public_key = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
+    )
 }
 
 #[cfg(test)]
@@ -404,31 +477,55 @@ mod tests {
         let alice = fresh_secret();
         let alice_report = open(&flag, &defender_public, &alice, "Alice's report").unwrap();
         let bob_report = open(&flag, &defender_public, &fresh_secret(), "Bob's report").unwrap();
+        let mut forged = alice_report.clone();
+        forged.proof.signature = "00".repeat(64);
+        assert_eq!(
+            request(&router, Method::POST, "/report", Some(json!(forged)))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let mut accepted = Vec::new();
         for (report, status) in [
             (&alice_report, StatusCode::CREATED),
             (&alice_report, StatusCode::OK),
             (&bob_report, StatusCode::CREATED),
         ] {
-            assert_eq!(
-                request(&router, Method::POST, "/threads", Some(json!(report)))
-                    .await
-                    .0,
-                status
-            );
+            let (actual, body) =
+                request(&router, Method::POST, "/report", Some(json!(report))).await;
+            assert_eq!(actual, status);
+            let response: crate::threads::AcceptedOpening = serde_json::from_str(&body).unwrap();
+            assert_eq!(&response.opening, report);
+            if status == StatusCode::CREATED {
+                assert_eq!(response.receipt.sequence, accepted.len() as i64 + 1);
+                accepted.push(response.receipt);
+            } else {
+                assert_eq!(Some(&response.receipt), accepted.last());
+            }
         }
 
         // A second opening with Alice's ID must leave neither an extra thread nor a proof.
         let conflicting = open(&flag, &defender_public, &alice, "new opening").unwrap();
         assert_eq!(
-            request(&router, Method::POST, "/threads", Some(json!(conflicting)))
+            request(&router, Method::POST, "/report", Some(json!(conflicting)))
                 .await
                 .0,
             StatusCode::CONFLICT
         );
         let route = format!("/dossiers/{}", manifest.public_key);
+        let proofs = [&alice_report.proof, &bob_report.proof];
+        let proof_url = format!("{route}/proofs?limit=1");
+        assert_eq!(
+            read(&router, &proof_url).await,
+            json!({"items": [proofs[0]], "next_after": 1})
+        );
+        assert_eq!(
+            read(&router, &format!("{proof_url}&after=1")).await,
+            json!({"items": [proofs[1]], "next_after": null})
+        );
         assert_eq!(
             read(&router, &format!("{route}/proofs")).await,
-            json!([alice_report.proof, bob_report.proof])
+            json!(proofs)
         );
 
         let entries = format!("/threads/{}/messages", alice_report.participants.finder);
@@ -464,6 +561,13 @@ mod tests {
                 status
             );
         }
+        let second_reply = encrypt(&alice_report.participants, &alice, "More evidence").unwrap();
+        assert_eq!(
+            request(&router, Method::POST, &entries, Some(json!(second_reply)))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
 
         // These submissions would expose a note to the public or all holders of the flag.
         for (route, body) in [
@@ -490,19 +594,49 @@ mod tests {
             request(&router, Method::POST, "/proofs", Some(json!(bare)))
                 .await
                 .0,
-            StatusCode::CREATED
+            StatusCode::BAD_REQUEST
         );
 
         drop(router);
-        let reopened = app(Connection::open(file.path()).unwrap()).unwrap();
+        // An older server could accept bare proofs independently of any thread.
+        let db = Connection::open(file.path()).unwrap();
+        assert!(insert_proof(&db, &bare).unwrap());
+        let reopened = app(db).unwrap();
+        let old_proofs = read(&reopened, &format!("{route}/proofs")).await;
+        assert!(old_proofs.as_array().unwrap().contains(&json!(bare)));
         assert_eq!(
-            read(&reopened, &format!("{route}/threads")).await,
-            json!([alice_report, bob_report])
+            read(&reopened, &format!("{route}/threads?limit=1")).await,
+            json!({"items": [accepted[0]], "next_after": 1})
+        );
+        assert_eq!(
+            read(&reopened, &format!("{route}/threads?limit=1&after=1")).await,
+            json!({"items": [accepted[1]], "next_after": null})
+        );
+        assert_eq!(
+            request(
+                &reopened,
+                Method::GET,
+                &format!("{route}/threads?limit=51"),
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
         );
         let alice_thread = format!("/threads/{}", alice_report.participants.finder);
         assert_eq!(read(&reopened, &alice_thread).await, json!(alice_report));
-        assert_eq!(read(&reopened, &entries).await, json!([reply]));
-        assert_eq!(read(&reopened, &wrong).await, json!([]));
+        assert_eq!(
+            read(&reopened, &format!("{entries}?limit=1")).await,
+            json!({"items": [reply], "next_after": 1})
+        );
+        assert_eq!(
+            read(&reopened, &format!("{entries}?after=1")).await,
+            json!({"items": [second_reply], "next_after": null})
+        );
+        assert_eq!(
+            read(&reopened, &wrong).await,
+            json!({"items": [], "next_after": null})
+        );
         assert_eq!(
             read(&reopened, &format!("{route}/messages")).await,
             json!([])
@@ -524,6 +658,57 @@ mod tests {
                 request(&router, Method::POST, uri, Some(body)).await.0,
                 StatusCode::CREATED
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_history_requires_paging_when_a_single_page_would_drop_entries() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (key, manifest) = generate(Map::new());
+        let router = app(Connection::open(file.path()).unwrap()).unwrap();
+        assert_eq!(
+            request(&router, Method::POST, "/dossiers", Some(json!(manifest)))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        let db = Connection::open(file.path()).unwrap();
+        let mut last_proof = Value::Null;
+        let mut last_message = Value::Null;
+        for i in 1..=51 {
+            let proof = prove_with_reply(&key, String::new(), &i.to_string()).unwrap();
+            let entry = proof.reply.as_ref().unwrap();
+            store_message(&db, entry).unwrap();
+            insert_proof(&db, &proof).unwrap();
+            last_message = json!(entry);
+            last_proof = json!(proof);
+        }
+        let flag = &manifest.public_key;
+        for route in [
+            format!("/dossiers/{flag}/proofs"),
+            format!("/canaries/{flag}/proofs"),
+            format!("/dossiers/{flag}/messages"),
+            format!("/canaries/{flag}/record"),
+        ] {
+            let (status, _) = request(&router, Method::GET, &route, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, page) =
+                request(&router, Method::GET, &format!("{route}?after=0"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let page: crate::threads::Page<Value> = serde_json::from_str(&page).unwrap();
+            assert_eq!(page.items.len(), 50);
+            assert_eq!(page.next_after, Some(50));
+            let (status, last) =
+                request(&router, Method::GET, &format!("{route}?after=50"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let last: crate::threads::Page<Value> = serde_json::from_str(&last).unwrap();
+            assert_eq!(last.next_after, None);
+            let expected = if route.ends_with("/proofs") {
+                &last_proof
+            } else {
+                &last_message
+            };
+            assert_eq!(&last.items[..], std::slice::from_ref(expected));
         }
     }
 

@@ -21,7 +21,7 @@ fn default_api() -> String {
 }
 
 fn reporting_instructions() -> String {
-    "Found this key? Install the CLI: curl -fsSL https://kompromat.sh/cli | sh. Report access with: kompromat report PATH_TO_THIS_FILE. Or generate a proof locally and use the HTTP instructions in submission. Never upload this key file or secret_key. Optionally add --reply \"your message\" for an encrypted response.".into()
+    "Report access with: kompromat report PATH_TO_THIS_FILE. To include a shared note, add --hunt HUNT_URL --message 'your note'. Use the hunt URL from the registry. Never upload this file.".into()
 }
 
 /// Public, self-contained directions for submitting proof of access.
@@ -48,7 +48,7 @@ impl Submission {
             method: "POST".into(),
             content_type: "application/json".into(),
             cli: "kompromat report PATH_TO_THIS_FILE".into(),
-            proof_format: "Generate proof.json locally: kompromat prove PATH_TO_THIS_FILE > proof.json. To include an encrypted note, add --reply to the prove command with the note as its argument. For a proof without a note, an independent client can decode secret_key as a 32-byte Schnorrkel MiniSecretKey, expand with ExpansionMode::Ed25519, and sign the empty byte string using context kompromat:proof:v1. Keep the template's message field empty. Encode the public key (32 bytes) and signature (64 bytes) as lowercase hex. Do not send secret_key.".into(),
+            proof_format: "kompromat prove PATH_TO_THIS_FILE > proof.json. For a shared note add --manifest TRUSTED_MANIFEST --message 'your note'. Bare proof: expand the 32-byte Schnorrkel MiniSecretKey with ExpansionMode::Ed25519 and sign the empty message under kompromat:proof:v1. Use lowercase hex for the public key and signature. Never send secret_key.".into(),
             body: serde_json::json!({"public_key": public_key, "message": "", "signature": "<locally generated Schnorr signature>"}),
         }
     }
@@ -91,6 +91,17 @@ pub struct Manifest {
     pub defender_public_key: Option<String>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
+}
+
+impl Manifest {
+    /// Match a found flag to an independently obtained hunt manifest.
+    pub fn verify_flag(&self, public_key: &str, defender: Option<&str>) -> Result<()> {
+        ensure!(
+            self.public_key == public_key && self.defender_public_key.as_deref() == defender,
+            "flag does not match the registered hunt"
+        );
+        Ok(())
+    }
 }
 
 // Compatibility with callers of the original Rust API.
@@ -148,7 +159,7 @@ pub fn generate_private_for_api(
     let instructions = metadata.remove("instructions");
     ensure!(
         !metadata.contains_key("submission"),
-        "private finder reports use the /threads endpoint"
+        "private reports use the registered hunt's /report endpoint"
     );
     let (mut flag, mut manifest) = generate_for_api(metadata, api);
     let defender_secret = threads::fresh_secret();
@@ -156,7 +167,7 @@ pub fn generate_private_for_api(
     flag.defender_public_key = Some(defender_public.clone());
     manifest.defender_public_key = Some(defender_public);
 
-    flag.instructions = "Found this flag? Run kompromat report PATH_TO_THIS_FILE --message 'your write-up'. Keep the local dossier key to read and reply. Never upload the flag or the dossier key.".into();
+    flag.instructions = "Run kompromat report PATH_TO_THIS_FILE --hunt HUNT_URL --message 'your write-up'. Use the hunt URL from the registry. Keep the dossier key to read and reply.".into();
     // The legacy curl template describes a different endpoint and message format.
     flag.submission = None;
     manifest.metadata.remove("submission");

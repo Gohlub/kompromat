@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{BufRead, BufReader},
+    net::TcpListener,
     path::Path,
     process::{Child, Command, Output, Stdio},
 };
@@ -14,6 +15,14 @@ struct Api {
 }
 
 impl Api {
+    fn hunt(&self, manifest: &Value) -> String {
+        format!(
+            "{}/dossiers/{}",
+            self.url,
+            manifest["public_key"].as_str().unwrap()
+        )
+    }
+
     fn start(dir: &Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_kompromat-api"))
             .current_dir(dir)
@@ -82,6 +91,7 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     ));
     fs::write(path.join("manifest.json"), manifest.to_string()).unwrap();
     success(cli(path, &["register", "manifest.json", "--api", &api.url]));
+    let hunt = api.hunt(&manifest);
 
     let mut receipts = Vec::new();
     for (out_flag, file, note) in [
@@ -94,7 +104,16 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     ] {
         let report = success(cli(
             path,
-            &["report", "flag.json", "--message", note, out_flag, file],
+            &[
+                "report",
+                "flag.json",
+                "--hunt",
+                &hunt,
+                "--message",
+                note,
+                out_flag,
+                file,
+            ],
         ));
         let receipt = &report["receipt"];
         assert_eq!(report["dossier_key_file"], file);
@@ -119,6 +138,7 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
         path,
         &[
             "attach",
+            "--key",
             "defender.json",
             "--dossier",
             alice,
@@ -128,11 +148,14 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     ));
     success(cli(
         path,
-        &["attach", "alice.json", "--message", "GET /export"],
+        &["attach", "--key", "alice.json", "--message", "GET /export"],
     ));
 
-    let transcript =
-        serde_json::json!(["Alice found an export bug", "Which request?", "GET /export"]);
+    let transcript = serde_json::json!([
+        {"sender": "finder", "text": "Alice found an export bug"},
+        {"sender": "defender", "text": "Which request?"},
+        {"sender": "finder", "text": "GET /export"},
+    ]);
     assert_eq!(
         success(cli(path, &["unlock", "alice.json"]))["messages"],
         transcript
@@ -143,7 +166,7 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     );
     assert_eq!(
         success(cli(path, &["unlock", "bob.json"]))["messages"],
-        serde_json::json!(["Bob found a cache bug"])
+        serde_json::json!([{"sender": "finder", "text": "Bob found a cache bug"}])
     );
     assert!(
         !cli(path, &["unlock", "bob.json", "--dossier", alice])
@@ -177,11 +200,116 @@ fn finders_of_the_same_flag_have_separate_dossiers() {
     .unwrap();
     assert!(shared.is_empty());
 
-    let capture = success(cli(path, &["report", "flag.json"]));
+    let capture = success(cli(path, &["report", "flag.json", "--hunt", &hunt]));
     let id = capture["receipt"]["dossier_id"].as_str().unwrap();
     let default_file = format!("dossier-key-{id}.json");
     assert_eq!(capture["dossier_key_file"], default_file);
     assert!(path.join(default_file).is_file());
+}
+
+#[test]
+fn reports_verify_the_hunt_before_sending_any_writeup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let registry = Api::start(path);
+    let manifest = success(cli(
+        path,
+        &[
+            "generate",
+            "--out",
+            "flag",
+            "--defender-out",
+            "def",
+            "--api",
+            &registry.url,
+        ],
+    ));
+    fs::write(path.join("manifest"), manifest.to_string()).unwrap();
+    success(cli(path, &["register", "manifest", "--api", &registry.url]));
+    let hunt = registry.hunt(&manifest);
+
+    let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+    let hostile_api = format!("http://{}", trap.local_addr().unwrap());
+    let mut flag: Value = serde_json::from_slice(&fs::read(path.join("flag")).unwrap()).unwrap();
+    flag["api"] = hostile_api.clone().into();
+    let write_flag = |flag: &Value| fs::write(path.join("found"), flag.to_string()).unwrap();
+    let report = [
+        "report",
+        "found",
+        "--hunt",
+        &hunt,
+        "--message",
+        "private",
+        "--dossier-key-out",
+        "saved",
+    ];
+
+    // Even with a hostile address in the flag, a valid report goes to the selected hunt.
+    write_flag(&flag);
+    let accepted = success(cli(path, &report));
+    assert_eq!(accepted["receipt"]["sequence"], 1);
+    let mut saved: Value = serde_json::from_slice(&fs::read(path.join("saved")).unwrap()).unwrap();
+    assert_eq!(saved["api"], registry.url);
+    // A captured file must never become another finder's follow-up credential.
+    write_flag(&saved);
+    assert!(
+        !cli(
+            path,
+            &["attach", "found", "--hunt", &hunt, "--message", "private"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !cli(path, &["report", "saved", "--api", &hostile_api])
+            .status
+            .success()
+    );
+    saved.as_object_mut().unwrap().remove("hunt");
+    saved["api"] = hostile_api.clone().into();
+    fs::write(path.join("old-key"), saved.to_string()).unwrap();
+    assert!(
+        !cli(
+            path,
+            &["attach", "--key", "old-key", "--message", "private"]
+        )
+        .status
+        .success()
+    );
+    let retry = success(cli(path, &["report", "old-key", "--hunt", &hunt]));
+    assert_eq!(retry["receipt"], accepted["receipt"]);
+    fs::remove_file(path.join("saved")).unwrap();
+
+    let other = success(cli(path, &["generate", "--out", "other"]));
+    flag["defender_public_key"] = other["public_key"].clone();
+    write_flag(&flag);
+    assert!(!cli(path, &report).status.success());
+    flag.as_object_mut().unwrap().remove("defender_public_key");
+    write_flag(&flag);
+    for args in [
+        &report[..],
+        &["report", "found", "--message", "private"],
+        &["attach", "found", "--hunt", &hunt, "--message", "private"],
+        &[
+            "prove",
+            "found",
+            "--manifest",
+            "manifest",
+            "--message",
+            "private",
+        ],
+        &["prove", "found", "--message", "private"],
+    ] {
+        let output = cli(path, args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert!(!path.join("saved").exists());
+    trap.set_nonblocking(true).unwrap();
+    assert_eq!(
+        trap.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]
@@ -209,7 +337,14 @@ fn shared_key_unlocks_encrypted_dossier_over_http_and_after_restart() {
     for (key, message) in ["key.json", "finder.json"].into_iter().zip(messages) {
         let entry = success(cli(
             dir.path(),
-            &["attach", key, "--message", message, "--api", &api.url],
+            &[
+                "attach",
+                key,
+                "--message",
+                message,
+                "--hunt",
+                &api.hunt(&public),
+            ],
         ));
         assert!(entry.get("ciphertext").is_some());
         assert!(!entry.to_string().contains(message));
@@ -245,6 +380,18 @@ fn shared_key_unlocks_encrypted_dossier_over_http_and_after_restart() {
     ));
     assert_eq!(unlocked["messages"], serde_json::json!(messages));
     assert_eq!(unlocked["public_key"], public["public_key"]);
+    let later = success(cli(
+        dir.path(),
+        &[
+            "unlock",
+            "finder.json",
+            "--api",
+            &restarted.url,
+            "--after",
+            "1",
+        ],
+    ));
+    assert_eq!(later["messages"], serde_json::json!([messages[1]]));
     success(cli(dir.path(), &["generate", "--out", "wrong.json"]));
     let wrong = cli(
         dir.path(),
@@ -262,7 +409,14 @@ fn proof_can_respond_privately_in_one_submission() {
     let private = "Found in the internal backup; here is how.";
     let proof = success(cli(
         dir.path(),
-        &["prove", "key.json", "--message", private],
+        &[
+            "prove",
+            "key.json",
+            "--manifest",
+            "manifest.json",
+            "--message",
+            private,
+        ],
     ));
     assert_eq!(proof["message"], "");
     assert!(proof["reply"]["ciphertext"].is_string());
@@ -392,7 +546,17 @@ fn report_defaults_to_access_proof_using_the_key_file_api() {
     let notes = ["Location of the canary", "Follow-up from the finder"];
     let mut expected_proofs = vec![proof];
     for (flag, note) in ["--message", "--reply"].into_iter().zip(notes) {
-        let report = success(cli(dir.path(), &["report", "key.json", flag, note]));
+        let report = success(cli(
+            dir.path(),
+            &[
+                "report",
+                "key.json",
+                "--hunt",
+                &api.hunt(&public),
+                flag,
+                note,
+            ],
+        ));
         assert_eq!(report["message"], "");
         assert!(report["reply"]["ciphertext"].is_string());
         assert!(!report.to_string().contains(note));

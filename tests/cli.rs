@@ -69,7 +69,14 @@ fn offline_flow_and_secret_file_protection() {
 
     let proven = cli(
         dir.path(),
-        &["prove", "secret.json", "--message", "found it"],
+        &[
+            "prove",
+            "secret.json",
+            "--manifest",
+            "manifest.json",
+            "--message",
+            "found it",
+        ],
     );
     assert!(
         proven.status.success(),

@@ -9,3 +9,6 @@
 /dossier.json
 dossier-key-*.json
 /manifest.json
+/flag.json
+/defender.json
+/alice.json
