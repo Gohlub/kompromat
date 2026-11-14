@@ -249,7 +249,8 @@ fn reports_verify_the_hunt_before_sending_any_writeup() {
     let accepted = success(cli(path, &report));
     assert_eq!(accepted["receipt"]["sequence"], 1);
     let mut saved: Value = serde_json::from_slice(&fs::read(path.join("saved")).unwrap()).unwrap();
-    assert_eq!(saved["api"], registry.url);
+    assert_eq!(saved["hunt"], hunt);
+    assert!(saved.get("api").is_none());
     // A captured file must never become another finder's follow-up credential.
     write_flag(&saved);
     assert!(
@@ -334,17 +335,14 @@ fn shared_key_unlocks_encrypted_dossier_over_http_and_after_restart() {
         "Private instructions: leave a note here.",
         "Found in the archive. 🦀",
     ];
-    for (key, message) in ["key.json", "finder.json"].into_iter().zip(messages) {
+    let hunt = api.hunt(&public);
+    for (key, message, option, destination) in [
+        ("key.json", messages[0], "--hunt", &hunt),
+        ("finder.json", messages[1], "--api", &api.url),
+    ] {
         let entry = success(cli(
             dir.path(),
-            &[
-                "attach",
-                key,
-                "--message",
-                message,
-                "--hunt",
-                &api.hunt(&public),
-            ],
+            &["attach", key, "--message", message, option, destination],
         ));
         assert!(entry.get("ciphertext").is_some());
         assert!(!entry.to_string().contains(message));

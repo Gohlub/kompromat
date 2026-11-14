@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 const CONTEXT: &[u8] = b"kompromat:proof:v1";
 const REPLY_CONTEXT: &[u8] = b"kompromat:proof-reply:v1";
 pub const DEFAULT_API: &str = "http://127.0.0.1:3000";
+const PRIVATE_REPORTING_INSTRUCTIONS: &str = "Run kompromat report PATH_TO_THIS_FILE --hunt HUNT_URL --message 'your write-up'. Use the hunt URL from the registry. Keep the dossier key to read and reply.";
 
 fn default_api() -> String {
     DEFAULT_API.into()
@@ -123,59 +124,65 @@ pub fn generate(metadata: Map<String, Value>) -> (Key, Manifest) {
     generate_for_api(metadata, DEFAULT_API)
 }
 
-pub fn generate_for_api(mut metadata: Map<String, Value>, api: &str) -> (Key, Manifest) {
-    let secret = MiniSecretKey::generate();
-    let keypair = secret.expand_to_keypair(ExpansionMode::Ed25519);
-    let public_key = hex::encode(keypair.public.to_bytes());
-    let submission = Submission::new(api, &public_key);
-    let instructions = reporting_instructions();
-    metadata
-        .entry("instructions")
-        .or_insert_with(|| Value::String(instructions.clone()));
-    metadata
-        .entry("submission")
-        .or_insert_with(|| serde_json::json!(submission));
-    (
-        Key {
-            secret_key: hex::encode(secret.to_bytes()),
-            defender_public_key: None,
-            api: api.into(),
-            instructions,
-            submission: Some(submission),
-        },
-        Manifest {
-            public_key,
-            defender_public_key: None,
-            metadata,
-        },
-    )
+pub fn generate_for_api(metadata: Map<String, Value>, api: &str) -> (Key, Manifest) {
+    generate_flag(metadata, api, None)
 }
 
 /// Generate a planted flag and a separate, defender-only credential.
 pub fn generate_private_for_api(
-    mut metadata: Map<String, Value>,
+    metadata: Map<String, Value>,
     api: &str,
 ) -> Result<(Key, Manifest, String)> {
-    let instructions = metadata.remove("instructions");
     ensure!(
         !metadata.contains_key("submission"),
         "private reports use the registered hunt's /report endpoint"
     );
-    let (mut flag, mut manifest) = generate_for_api(metadata, api);
-    let defender_secret = threads::fresh_secret();
-    let defender_public = threads::participant_public(&defender_secret)?;
-    flag.defender_public_key = Some(defender_public.clone());
-    manifest.defender_public_key = Some(defender_public);
+    let (secret, public) = generate_keypair();
+    let (flag, manifest) = generate_flag(metadata, api, Some(public));
+    Ok((flag, manifest, secret))
+}
 
-    flag.instructions = "Run kompromat report PATH_TO_THIS_FILE --hunt HUNT_URL --message 'your write-up'. Use the hunt URL from the registry. Keep the dossier key to read and reply.".into();
-    // The legacy curl template describes a different endpoint and message format.
-    flag.submission = None;
-    manifest.metadata.remove("submission");
-    manifest.metadata.insert(
-        "instructions".into(),
-        instructions.unwrap_or_else(|| Value::String(flag.instructions.clone())),
-    );
-    Ok((flag, manifest, defender_secret))
+fn generate_keypair() -> (String, String) {
+    let secret = MiniSecretKey::generate();
+    let keypair = secret.expand_to_keypair(ExpansionMode::Ed25519);
+    (
+        hex::encode(secret.to_bytes()),
+        hex::encode(keypair.public.to_bytes()),
+    )
+}
+
+fn generate_flag(
+    mut metadata: Map<String, Value>,
+    api: &str,
+    defender_public_key: Option<String>,
+) -> (Key, Manifest) {
+    let (secret_key, public_key) = generate_keypair();
+    let (instructions, submission) = if defender_public_key.is_some() {
+        (PRIVATE_REPORTING_INSTRUCTIONS.into(), None)
+    } else {
+        let submission = Submission::new(api, &public_key);
+        metadata
+            .entry("submission")
+            .or_insert_with(|| serde_json::json!(submission));
+        (reporting_instructions(), Some(submission))
+    };
+    metadata
+        .entry("instructions")
+        .or_insert_with(|| Value::String(instructions.clone()));
+    (
+        Key {
+            secret_key,
+            defender_public_key: defender_public_key.clone(),
+            api: api.into(),
+            instructions,
+            submission,
+        },
+        Manifest {
+            public_key,
+            defender_public_key,
+            metadata,
+        },
+    )
 }
 
 pub fn prove(key: &Key, message: String) -> Result<Proof> {
@@ -264,6 +271,17 @@ fn decode<const N: usize>(encoded: &str) -> Result<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_manifest_preserves_the_brief_and_omits_shared_submission() {
+        let mut metadata = Map::new();
+        metadata.insert("instructions".into(), Value::String("hunt brief".into()));
+        let (flag, manifest, _) = generate_private_for_api(metadata, DEFAULT_API).unwrap();
+        assert_eq!(manifest.metadata["instructions"], "hunt brief");
+        assert_eq!(flag.instructions, PRIVATE_REPORTING_INSTRUCTIONS);
+        assert!(!manifest.metadata.contains_key("submission"));
+        assert!(flag.submission.is_none());
+    }
 
     #[test]
     fn proof_roundtrip_keeps_secret_local() {

@@ -13,7 +13,9 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
-use super::{client, hunt_api, hunt_base, post, print_json, response_json_bound, write_secret};
+use super::{
+    client, hunt_base, post, print_json, registered_hunt, response_json_bound, write_secret,
+};
 
 // A full page holds up to 50 messages of 16 KiB each, encoded as hex.
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
@@ -30,7 +32,8 @@ pub(super) enum Credential {
     Finder {
         opening: Box<Opening>,
         secret: String,
-        api: String,
+        #[serde(default, rename = "api", skip_serializing)]
+        _legacy_api: Option<String>,
         #[serde(default)]
         hunt: Option<String>,
     },
@@ -60,7 +63,7 @@ impl Credential {
                         saved.as_deref().is_none_or(|url| url == link.as_str()),
                         "hunt differs from the one saved in this dossier key"
                     );
-                    hunt_api(link, &p.flag, Some(&p.defender))?
+                    registered_hunt(link, &p.flag, Some(&p.defender))?.api
                 } else {
                     let link = saved.as_deref().context("this older dossier key requires --hunt with the hunt URL from the registry")?;
                     hunt_base(&Url::parse(link)?, &p.flag)?
@@ -147,20 +150,19 @@ pub(super) fn generate(
 
 pub(super) fn report(
     flag: &Key,
-    defender: &str,
+    manifest: &Manifest,
     message: &str,
     dossier_key_out: Option<PathBuf>,
-    api: &str,
     hunt: &str,
 ) -> Result<()> {
     let secret = threads::fresh_secret();
-    let opening = threads::open(flag, defender, &secret, message)?;
+    let opening = threads::open(flag, manifest, &secret, message)?;
     let path = dossier_key_out
         .unwrap_or_else(|| format!("dossier-key-{}.json", opening.participants.finder).into());
     let credential = Credential::Finder {
         secret,
         opening: Box::new(opening),
-        api: api.into(),
+        _legacy_api: None,
         hunt: Some(hunt.into()),
     };
     write_secret(&path, &credential)?;
@@ -294,10 +296,7 @@ fn get<T: DeserializeOwned>(api: &str, path: &str) -> Result<T> {
     let response = client()?
         .get(format!("{}/{path}", api.trim_end_matches('/')))
         .send()?;
-    Ok(serde_json::from_value(response_json_bound(
-        response,
-        MAX_RESPONSE_BYTES,
-    )?)?)
+    response_json_bound(response, MAX_RESPONSE_BYTES)
 }
 
 fn get_page<T: DeserializeOwned>(api: &str, path: &str, after: i64) -> Result<Page<T>> {
@@ -319,13 +318,7 @@ mod tests {
     fn transcript_attributes_only_verified_entries_and_preserves_readable_neighbors() {
         let (flag, manifest, defender) = generate_private_for_api(Map::new(), "unused").unwrap();
         let finder = threads::fresh_secret();
-        let opening = threads::open(
-            &flag,
-            manifest.defender_public_key.as_deref().unwrap(),
-            &finder,
-            "first",
-        )
-        .unwrap();
+        let opening = threads::open(&flag, &manifest, &finder, "first").unwrap();
         let p = &opening.participants;
 
         // A finder can sign arbitrary bytes, including an invalid AEAD tag.

@@ -29,9 +29,11 @@ pub fn app_with_releases(connection: Connection, release_base_url: &str) -> anyh
     anyhow::ensure!(
         url.scheme() == "https"
             && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none(),
-        "release base URL must be an HTTPS directory URL"
+        "release base URL must be an HTTPS directory URL without credentials, query, or fragment"
     );
     let installer = include_str!("../install.sh").replace(
         DEFAULT_RELEASE_BASE_URL,
@@ -283,16 +285,19 @@ fn history<T: DeserializeOwned>(
 ) -> Result<Json<History<T>>, ApiError> {
     let connection = database.lock().map_err(internal)?;
     find_manifest(&connection, key)?;
-    let Json(page) = query.read(&connection, sql, key, |row| read_json(row, 1))?;
     if query.after.is_some() || query.limit.is_some() {
+        let Json(page) = query.read(&connection, sql, key, |row| read_json(row, 1))?;
         return Ok(Json(History::Page(page)));
     }
-    if page.next_after.is_some() {
-        return Err(bad_request(
-            "more than 50 entries; request ?after=0 to paginate",
-        ));
-    }
-    Ok(Json(History::All(page.items)))
+
+    // The original API returns the whole history as an array. In SQLite LIMIT -1 is unlimited.
+    let mut statement = connection.prepare(sql).map_err(internal)?;
+    let items = statement
+        .query_map(params![key, 0, -1], |row| read_json(row, 1))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    Ok(Json(History::All(items)))
 }
 
 async fn list_proofs(
@@ -412,9 +417,9 @@ mod tests {
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains("default_release_url='https://releases.example/kompromat'"));
         assert!(script.contains("Checksum mismatch"));
-        assert!(
-            app_with_releases(Connection::open_in_memory().unwrap(), "http://example.com").is_err()
-        );
+        for invalid in ["http://example.com", "https://user:token@example.com"] {
+            assert!(app_with_releases(Connection::open_in_memory().unwrap(), invalid).is_err());
+        }
     }
 
     async fn request(
@@ -444,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn finder_openings_and_messages_are_atomic_and_scoped() {
-        use crate::threads::{encrypt, fresh_secret, open, participant_public};
+        use crate::threads::{encrypt, fresh_secret, open};
 
         async fn read(router: &Router, uri: &str) -> Value {
             let (status, document) = request(router, Method::GET, uri, None).await;
@@ -454,10 +459,8 @@ mod tests {
 
         let file = tempfile::NamedTempFile::new().unwrap();
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
-        let (flag, mut manifest) = generate(Map::new());
-        let defender = fresh_secret();
-        let defender_public = participant_public(&defender).unwrap();
-        manifest.defender_public_key = Some(defender_public.clone());
+        let (mut flag, manifest, defender) =
+            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
         for invalid in ["not a key".to_owned(), manifest.public_key.clone()] {
             let mut changed = manifest.clone();
             changed.defender_public_key = Some(invalid);
@@ -475,8 +478,8 @@ mod tests {
             StatusCode::CREATED
         );
         let alice = fresh_secret();
-        let alice_report = open(&flag, &defender_public, &alice, "Alice's report").unwrap();
-        let bob_report = open(&flag, &defender_public, &fresh_secret(), "Bob's report").unwrap();
+        let alice_report = open(&flag, &manifest, &alice, "Alice's report").unwrap();
+        let bob_report = open(&flag, &manifest, &fresh_secret(), "Bob's report").unwrap();
         let mut forged = alice_report.clone();
         forged.proof.signature = "00".repeat(64);
         assert_eq!(
@@ -505,7 +508,7 @@ mod tests {
         }
 
         // A second opening with Alice's ID must leave neither an extra thread nor a proof.
-        let conflicting = open(&flag, &defender_public, &alice, "new opening").unwrap();
+        let conflicting = open(&flag, &manifest, &alice, "new opening").unwrap();
         assert_eq!(
             request(&router, Method::POST, "/report", Some(json!(conflicting)))
                 .await
@@ -569,7 +572,8 @@ mod tests {
             StatusCode::CREATED
         );
 
-        // These submissions would expose a note to the public or all holders of the flag.
+        // A finder can strip the pin and attempt to submit a shared or public note.
+        flag.defender_public_key = None;
         for (route, body) in [
             (
                 "/proofs",
@@ -662,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_history_requires_paging_when_a_single_page_would_drop_entries() {
+    async fn shared_history_returns_the_full_array_unless_paging_is_requested() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let (key, manifest) = generate(Map::new());
         let router = app(Connection::open(file.path()).unwrap()).unwrap();
@@ -673,42 +677,41 @@ mod tests {
             StatusCode::CREATED
         );
         let db = Connection::open(file.path()).unwrap();
-        let mut last_proof = Value::Null;
-        let mut last_message = Value::Null;
+        let mut proofs = Vec::new();
+        let mut messages = Vec::new();
         for i in 1..=51 {
             let proof = prove_with_reply(&key, String::new(), &i.to_string()).unwrap();
             let entry = proof.reply.as_ref().unwrap();
             store_message(&db, entry).unwrap();
             insert_proof(&db, &proof).unwrap();
-            last_message = json!(entry);
-            last_proof = json!(proof);
+            messages.push(json!(entry));
+            proofs.push(json!(proof));
         }
         let flag = &manifest.public_key;
-        for route in [
-            format!("/dossiers/{flag}/proofs"),
-            format!("/canaries/{flag}/proofs"),
-            format!("/dossiers/{flag}/messages"),
-            format!("/canaries/{flag}/record"),
+        for (route, expected) in [
+            (format!("/dossiers/{flag}/proofs"), &proofs),
+            (format!("/canaries/{flag}/proofs"), &proofs),
+            (format!("/dossiers/{flag}/messages"), &messages),
+            (format!("/canaries/{flag}/record"), &messages),
         ] {
-            let (status, _) = request(&router, Method::GET, &route, None).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, body) = request(&router, Method::GET, &route, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                &serde_json::from_str::<Vec<Value>>(&body).unwrap(),
+                expected
+            );
             let (status, page) =
                 request(&router, Method::GET, &format!("{route}?after=0"), None).await;
             assert_eq!(status, StatusCode::OK);
             let page: crate::threads::Page<Value> = serde_json::from_str(&page).unwrap();
-            assert_eq!(page.items.len(), 50);
+            assert_eq!(page.items, expected[..50]);
             assert_eq!(page.next_after, Some(50));
             let (status, last) =
                 request(&router, Method::GET, &format!("{route}?after=50"), None).await;
             assert_eq!(status, StatusCode::OK);
             let last: crate::threads::Page<Value> = serde_json::from_str(&last).unwrap();
             assert_eq!(last.next_after, None);
-            let expected = if route.ends_with("/proofs") {
-                &last_proof
-            } else {
-                &last_message
-            };
-            assert_eq!(&last.items[..], std::slice::from_ref(expected));
+            assert_eq!(last.items, expected[50..]);
         }
     }
 

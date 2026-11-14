@@ -1,7 +1,7 @@
 //! Per-finder dossiers. A flag authorizes the opening; only the finder and the
 //! defender have the keys for the conversation, starting with its first note.
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chacha20poly1305::{
     XChaCha20Poly1305,
     aead::{Aead, AeadCore, OsRng, Payload},
@@ -188,16 +188,16 @@ fn opening_claim(p: &Participants, first: &ThreadMessage) -> Result<String> {
     ))
 }
 
-pub fn open(flag: &Key, defender: &str, finder_secret: &str, text: &str) -> Result<Opening> {
-    if let Some(pinned) = &flag.defender_public_key {
-        ensure!(
-            pinned == defender,
-            "defender key differs from the planted flag"
-        );
-    }
+/// Encrypt the first write-up to the defender in an independently obtained hunt manifest.
+pub fn open(flag: &Key, manifest: &Manifest, finder_secret: &str, text: &str) -> Result<Opening> {
+    let public_key = flag.public_key()?;
+    manifest.verify_flag(&public_key, flag.defender_public_key.as_deref())?;
     let participants = Participants {
-        flag: flag.public_key()?,
-        defender: defender.to_owned(),
+        flag: public_key,
+        defender: manifest
+            .defender_public_key
+            .clone()
+            .context("this hunt has no private dossier recipient")?,
         finder: participant_public(finder_secret)?,
     };
     let first = encrypt(&participants, finder_secret, text)?;
@@ -238,16 +238,13 @@ mod tests {
 
     #[test]
     fn each_finder_and_defender_can_read_only_their_exchange() {
-        let defender = fresh_secret();
-        let recipient = participant_public(&defender).unwrap();
-        let (mut flag, mut manifest) = crate::generate(Map::new());
-        flag.defender_public_key = Some(recipient.clone());
-        manifest.defender_public_key = Some(recipient.clone());
+        let (flag, mut manifest, defender) =
+            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
 
         let alice = fresh_secret();
         let bob = fresh_secret();
-        let a = open(&flag, &recipient, &alice, "Alice's private report").unwrap();
-        let b = open(&flag, &recipient, &bob, "Bob's private report").unwrap();
+        let a = open(&flag, &manifest, &alice, "Alice's private report").unwrap();
+        let b = open(&flag, &manifest, &bob, "Bob's private report").unwrap();
         for opening in [&a, &b] {
             verify_opening(opening, &manifest).unwrap();
         }
@@ -274,26 +271,42 @@ mod tests {
         splice.first = encrypt(&a.participants, &alice, "another signed entry").unwrap();
         assert!(verify_opening(&splice, &manifest).is_err());
         splice.first = a.first.clone();
-        splice.first.sender = recipient;
+        splice.first.sender = a.participants.defender.clone();
         assert!(verify_entry(&a.participants, &splice.first).is_err());
         assert!(verify_opening(&splice, &manifest).is_err());
 
-        assert!(open(&flag, &b.participants.finder, &alice, "wrong defender").is_err());
         manifest.defender_public_key = Some(b.participants.finder);
+        assert!(open(&flag, &manifest, &alice, "wrong defender").is_err());
         assert!(verify_opening(&a, &manifest).is_err());
     }
 
     #[test]
-    fn reject_keys_which_collapse_roles_and_invalid_encodings() {
-        let (flag, _) = crate::generate(Map::new());
-        let defender = fresh_secret();
-        let recipient = participant_public(&defender).unwrap();
+    fn opening_requires_the_private_flag_from_the_registered_hunt() {
+        let (mut flag, manifest, _) =
+            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
         let finder = fresh_secret();
-        assert!(open(&flag, &recipient, &defender, "").is_err());
-        assert!(open(&flag, &recipient, &flag.secret_key, "").is_err());
-        assert!(open(&flag, &flag.public_key().unwrap(), &finder, "").is_err());
-        assert!(open(&flag, &"00".repeat(32), &finder, "").is_err());
+        let mut other = manifest.clone();
+        other.public_key = participant_public(&finder).unwrap();
+        assert!(open(&flag, &other, &finder, "").is_err());
+        flag.defender_public_key = None;
+        assert!(open(&flag, &manifest, &finder, "").is_err());
+        let (shared, shared_manifest) = crate::generate(Map::new());
+        assert!(open(&shared, &shared_manifest, &finder, "").is_err());
+    }
+
+    #[test]
+    fn reject_keys_which_collapse_roles_and_invalid_encodings() {
+        let (mut flag, mut manifest, defender) =
+            crate::generate_private_for_api(Map::new(), crate::DEFAULT_API).unwrap();
+        let finder = fresh_secret();
+        assert!(open(&flag, &manifest, &defender, "").is_err());
+        assert!(open(&flag, &manifest, &flag.secret_key, "").is_err());
         let too_long = "a".repeat(MAX_MESSAGE_BYTES + 1);
-        assert!(open(&flag, &recipient, &finder, &too_long).is_err());
+        assert!(open(&flag, &manifest, &finder, &too_long).is_err());
+        for invalid in [flag.public_key().unwrap(), "00".repeat(32)] {
+            manifest.defender_public_key = Some(invalid.clone());
+            flag.defender_public_key = Some(invalid);
+            assert!(open(&flag, &manifest, &finder, "").is_err());
+        }
     }
 }

@@ -1,5 +1,7 @@
 #[path = "kompromat/private.rs"]
 mod private;
+#[path = "kompromat/shared.rs"]
+mod shared;
 
 use std::{
     fs::{self, OpenOptions},
@@ -12,8 +14,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use kompromat::{
-    DEFAULT_API, EncryptedMessage, Key, Manifest, Proof, decrypt_message, encrypt_message,
-    generate_for_api, prove, prove_with_reply, threads::Page, validate_public_key, verify,
+    DEFAULT_API, Key, Manifest, Proof, generate_for_api, prove, prove_with_reply,
+    validate_public_key, verify,
 };
 use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -123,7 +125,7 @@ enum Command {
         dossier: Option<String>,
         #[arg(long)]
         message: String,
-        /// Override the API address in the key file.
+        /// Registry for a shared flag. A private key already selects its registry.
         #[arg(long)]
         api: Option<String>,
     },
@@ -173,11 +175,7 @@ fn main() -> Result<()> {
         Command::Register { manifest, api } => {
             let manifest: Manifest = read_json(&manifest)?;
             validate_public_key(&manifest.public_key)?;
-            let hunt = Url::parse(&format!(
-                "{}/dossiers/{}",
-                api.trim_end_matches('/'),
-                manifest.public_key
-            ))?;
+            let hunt = hunt_url(&api, &manifest.public_key)?;
             check_hunt_url(&hunt)?;
             let registered: Manifest = post(&api, "dossiers", &manifest)?;
             ensure!(
@@ -220,22 +218,21 @@ fn main() -> Result<()> {
                 LocalKey::Flag(key) => key,
             };
             let api = if let Some(link) = hunt {
-                let api = hunt_api(
+                let registered = registered_hunt(
                     &link,
                     &secret.public_key()?,
                     secret.defender_public_key.as_deref(),
                 )?;
-                if let Some(defender) = &secret.defender_public_key {
+                if registered.manifest.defender_public_key.is_some() {
                     return private::report(
                         &secret,
-                        defender,
+                        &registered.manifest,
                         args.message.as_deref().unwrap_or_default(),
                         dossier_key_out,
-                        &api,
                         link.as_str(),
                     );
                 }
-                Some(api)
+                Some(registered.api)
             } else {
                 ensure!(
                     secret.defender_public_key.is_none() && args.message.is_none(),
@@ -248,18 +245,7 @@ fn main() -> Result<()> {
                 "--dossier-key-out requires a private dossier"
             );
             let proof = args.create_proof(&secret)?;
-            let url = if let Some(api) = api {
-                format!("{}/proofs", api.trim_end_matches('/'))
-            } else if let Some(submission) = &secret.submission {
-                ensure!(
-                    submission.method == "POST" && submission.content_type == "application/json",
-                    "report requires a JSON POST submission"
-                );
-                submission.url.clone()
-            } else {
-                format!("{}/proofs", secret.api.trim_end_matches('/'))
-            };
-            print_json(&post_url(&url, &proof)?)?;
+            shared::report(&secret, api.as_deref(), &proof)?;
         }
         Command::Submit { proof, api } => {
             let proof: Proof = read_json(&proof)?;
@@ -273,7 +259,7 @@ fn main() -> Result<()> {
                     metadata: Map::new(),
                 },
             )?;
-            print_json(&post::<Proof>(&api, "proofs", &proof)?)?;
+            shared::submit_proof(&format!("{}/proofs", api.trim_end_matches('/')), &proof)?;
         }
         Command::Verify { proof, manifest } => {
             verify(&read_json(&proof)?, &read_json(&manifest)?)?;
@@ -297,15 +283,8 @@ fn main() -> Result<()> {
                 );
             }
             let secret: Key = read_json(&flag.context("supply a shared flag or --key")?)?;
-            ensure!(
-                secret.defender_public_key.is_none(),
-                "use the dossier key or defender key to attach"
-            );
             ensure!(dossier.is_none(), "--dossier requires a defender key");
-            let link = hunt.context("supply --hunt with the hunt URL from the registry")?;
-            let api = hunt_api(&link, &secret.public_key()?, None)?;
-            let entry = encrypt_message(&secret, &message)?;
-            print_json(&post::<EncryptedMessage>(&api, "messages", &entry)?)?;
+            shared::attach(&secret, &message, hunt, api.as_deref())?;
         }
         Command::Unlock {
             key,
@@ -326,60 +305,18 @@ fn main() -> Result<()> {
                 }
                 LocalKey::Flag(key) => key,
             };
-            ensure!(
-                secret.defender_public_key.is_none(),
-                "use the dossier key or defender key to unlock"
-            );
             ensure!(dossier.is_none(), "--dossier requires a defender key");
-            let public_key = secret.public_key()?;
-            let api = if let Some(link) = hunt {
-                hunt_api(&link, &public_key, None)?
-            } else {
-                api.unwrap_or_else(|| secret.api.clone())
-            };
-            let after = after.unwrap_or_default();
-            let response = client()?
-                .get(format!(
-                    "{}/dossiers/{public_key}/messages?after={after}",
-                    api.trim_end_matches('/')
-                ))
-                .send()?;
-            let value = response_json_bound(response, 2 * 1024 * 1024)?;
-            let page: Page<Value> = if value.is_array() {
-                ensure!(after == 0, "registry does not support pagination");
-                Page {
-                    items: serde_json::from_value(value)?,
-                    next_after: None,
-                }
-            } else {
-                serde_json::from_value(value)?
-            };
-            ensure!(
-                page.next_after
-                    .is_none_or(|next| next > after && !page.items.is_empty()),
-                "invalid continuation from facilitator"
-            );
-            let messages: Vec<Value> = page
-                .items
-                .into_iter()
-                .map(|item| {
-                    match serde_json::from_value::<EncryptedMessage>(item)
-                        .ok()
-                        .and_then(|entry| decrypt_message(&secret, &entry).ok())
-                    {
-                        Some(text) => Value::String(text),
-                        None => json!({"error": "unreadable message"}),
-                    }
-                })
-                .collect();
-            let mut transcript = json!({"public_key": public_key, "messages": messages});
-            if let Some(next) = page.next_after {
-                transcript["next_after"] = next.into();
-            }
-            print_json(&transcript)?;
+            shared::unlock(&secret, hunt, api, after.unwrap_or_default())?;
         }
     }
     Ok(())
+}
+
+fn hunt_url(api: &str, flag: &str) -> Result<Url> {
+    Ok(Url::parse(&format!(
+        "{}/dossiers/{flag}",
+        api.trim_end_matches('/')
+    ))?)
 }
 
 fn check_hunt_url(link: &Url) -> Result<()> {
@@ -413,12 +350,17 @@ fn hunt_base(link: &Url, flag_id: &str) -> Result<String> {
     Ok(link.join("../")?.as_str().trim_end_matches('/').to_owned())
 }
 
-fn hunt_api(link: &Url, flag_id: &str, defender: Option<&str>) -> Result<String> {
+struct RegisteredHunt {
+    api: String,
+    manifest: Manifest,
+}
+
+fn registered_hunt(link: &Url, flag_id: &str, defender: Option<&str>) -> Result<RegisteredHunt> {
     let api = hunt_base(link, flag_id)?;
     let response = client()?.get(link.clone()).send()?;
-    let manifest: Manifest = serde_json::from_value(response_json_bound(response, 128 * 1024)?)?;
+    let manifest: Manifest = response_json_bound(response, 128 * 1024)?;
     manifest.verify_flag(flag_id, defender)?;
-    Ok(api)
+    Ok(RegisteredHunt { api, manifest })
 }
 
 fn write_secret(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -446,7 +388,32 @@ fn write_secret(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    const LIMIT: u64 = 1024 * 1024;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Opening a planted FIFO must not block before we can inspect its type.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "{} must be a regular file",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    ensure!(
+        bytes.len() as u64 <= LIMIT,
+        "{} exceeds 1 MiB",
+        path.display()
+    );
     serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
@@ -458,13 +425,13 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 }
 
 fn post<T: DeserializeOwned>(api: &str, resource: &str, body: &impl Serialize) -> Result<T> {
-    let response = post_url(&format!("{}/{resource}", api.trim_end_matches('/')), body)?;
-    Ok(serde_json::from_value(response)?)
+    post_url(&format!("{}/{resource}", api.trim_end_matches('/')), body)
 }
 
-fn post_url(url: &str, body: &impl Serialize) -> Result<Value> {
+fn post_url<T: DeserializeOwned>(url: &str, body: &impl Serialize) -> Result<T> {
     // A submission is capped at 64 KiB; its acknowledgment can also include a receipt.
-    response_json_bound(client()?.post(url).json(body).send()?, 128 * 1024)
+    let response = client()?.post(url).json(body).send()?;
+    response_json_bound(response, 128 * 1024)
 }
 
 fn client() -> Result<Client> {
@@ -474,7 +441,10 @@ fn client() -> Result<Client> {
         .build()?)
 }
 
-fn response_json_bound(response: reqwest::blocking::Response, max_bytes: u64) -> Result<Value> {
+fn response_json_bound<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    max_bytes: u64,
+) -> Result<T> {
     let status = response.status();
     let limit = if status.is_success() { max_bytes } else { 4096 };
     let mut bytes = Vec::new();
