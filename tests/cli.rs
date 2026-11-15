@@ -15,7 +15,7 @@ fn cli(dir: &std::path::Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn offline_flow_and_secret_file_protection() {
+fn offline_proof_and_secret_file_protection() {
     let dir = tempdir().unwrap();
     let generated = cli(
         dir.path(),
@@ -67,10 +67,7 @@ fn offline_flow_and_secret_file_protection() {
     );
     assert!(!dir.path().join("bad.json").exists());
 
-    let proven = cli(
-        dir.path(),
-        &["prove", "secret.json", "--message", "found it"],
-    );
+    let proven = cli(dir.path(), &["prove", "secret.json"]);
     assert!(
         proven.status.success(),
         "{}",
@@ -107,4 +104,83 @@ fn offline_flow_and_secret_file_protection() {
         .status
         .success()
     );
+}
+
+#[test]
+fn manifest_output_is_created_once() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let generate = |flag: &str, defender: &str| {
+        cli(
+            path,
+            &[
+                "generate",
+                "--out",
+                flag,
+                "--defender-out",
+                defender,
+                "--manifest-out",
+                "manifest",
+            ],
+        )
+    };
+    let first = generate("flag", "defender");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stdout.is_empty());
+    let saved = fs::read(path.join("manifest")).unwrap();
+    let manifest: kompromat::Manifest = serde_json::from_slice(&saved).unwrap();
+    let flag: kompromat::Key =
+        serde_json::from_slice(&fs::read(path.join("flag")).unwrap()).unwrap();
+    assert_eq!(manifest.public_key, flag.public_key().unwrap());
+    assert_eq!(manifest.defender_public_key, flag.defender_public_key);
+
+    let collision = generate("another-flag", "another-defender");
+    assert!(!collision.status.success());
+    assert_eq!(fs::read(path.join("manifest")).unwrap(), saved);
+    assert!(!path.join("another-flag").exists());
+    assert!(!path.join("another-defender").exists());
+}
+
+#[test]
+fn generation_errors_preserve_existing_files() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    fs::write(path.join("flag"), "existing flag").unwrap();
+    let collision = cli(path, &["generate", "--out", "flag"]);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(fs::read(path.join("flag")).unwrap(), b"existing flag");
+    assert!(!path.join("defender.json").exists());
+
+    fs::write(path.join("defender.json"), "existing defender").unwrap();
+    let collision = cli(path, &["generate", "--out", "new-flag"]);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(
+        fs::read(path.join("defender.json")).unwrap(),
+        b"existing defender"
+    );
+    assert!(!path.join("new-flag").exists());
+}
+
+#[test]
+fn flag_input_must_be_a_regular_file_under_the_limit() {
+    let dir = tempdir().unwrap();
+    fs::File::create(dir.path().join("oversize"))
+        .unwrap()
+        .set_len(1024 * 1024 + 1)
+        .unwrap();
+    for (name, reason) in [
+        ("oversize", "exceeds 1 MiB"),
+        #[cfg(unix)]
+        ("/dev/null", "must be a regular file"),
+    ] {
+        let output = cli(dir.path(), &["prove", name]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(reason));
+    }
 }

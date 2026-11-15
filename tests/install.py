@@ -96,6 +96,16 @@ shutil.copyfile(asset, args[args.index("-o") + 1])
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_hash_failure_cannot_authorize_installation(self):
+        checksum = self.release("x86_64-unknown-linux-musl")
+        (self.bin / "sha256sum").unlink(missing_ok=True)
+        self.write_tool("sha256sum", "#!/bin/sh\nexit 1\n")
+        for expected in [checksum.read_text(), ""]:
+            with self.subTest(expected=expected):
+                checksum.write_text(expected)
+                self.assertNotEqual(self.install().returncode, 0)
+                self.assertFalse(self.destination.exists())
+
     def test_missing_release_and_unsupported_platform_fail(self):
         self.assertNotEqual(self.install().returncode, 0)
         result = self.install("Windows", "x86_64")

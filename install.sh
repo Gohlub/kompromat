@@ -31,7 +31,7 @@ main() {
     fi
 
     archive="kompromat-$target.tar.gz"
-    work_dir=$(mktemp -d)
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/kompromat-install.XXXXXXXX")
     staged_binary=
     trap 'rm -rf "$work_dir"; [ -z "$staged_binary" ] || rm -f "$staged_binary"' EXIT
     trap 'exit 1' HUP INT TERM
@@ -41,13 +41,13 @@ main() {
     curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 \
         "${release_url%/}/$archive.sha256" -o "$work_dir/checksum"
 
-    expected=$(awk 'NR == 1 {print $1}' "$work_dir/checksum")
+    expected=$(awk 'NR == 1 && length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ { print tolower($1) }' "$work_dir/checksum")
     if [ "$hash_command" = sha256sum ]; then
-        actual=$(sha256sum "$work_dir/$archive" | awk '{print $1}')
+        result=$(sha256sum "$work_dir/$archive")
     else
-        actual=$(shasum -a 256 "$work_dir/$archive" | awk '{print $1}')
+        result=$(shasum -a 256 "$work_dir/$archive")
     fi
-    if [ "$expected" != "$actual" ]; then
+    if [ -z "$expected" ] || [ "$expected" != "${result%% *}" ]; then
         printf '%s\n' 'Checksum mismatch; nothing was installed.' >&2
         exit 1
     fi
